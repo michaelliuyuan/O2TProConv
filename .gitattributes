@@ -1,0 +1,11 @@
+# 统一 LF 行尾，避免 Windows clone 带 \r 致 shebang `bash\r` 起不来（@测试 fail 清单）。
+* text=auto eol=lf
+
+# 脚本强制 LF（跨平台可执行）
+*.sh   text eol=lf
+bin/*  text eol=lf
+
+# SQL/配置/文档也走 LF
+*.sql   text eol=lf
+*.conf  text eol=lf
+*.md    text eol=lf

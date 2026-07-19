@@ -11,6 +11,10 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 LIB_DIR="$ROOT_DIR/lib"
 # shellcheck source=../lib/common.sh
 source "$LIB_DIR/common.sh"
+# common.sh 开了 set -e（errexit）——会让失败的探针 mysql_tidb 直接终止运行器，
+# rc 抓不到、后续探针与合计行全部丢失（@测试 fail 清单：06_bare_assign 失败即 abort）。
+# 本运行器逐探针判 rc 自管错误，关掉 errexit（保留 -u / pipefail）。
+set +e
 
 main() {
   local cfg=""
