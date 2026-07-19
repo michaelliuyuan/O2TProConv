@@ -1,0 +1,28 @@
+# ora2tidb.conf.example —— Oracle 存储过程 → TiDB 转换工具配置模板（对齐设计文档 §4.4）。
+# 复制为 ora2tidb.conf 并按实际填写；ora2tidb.conf 被 .gitignore 忽略，不会提交。
+
+# ===== Oracle 连接（export 导出 + compare 对比）=====
+ORACLE_USER=your_ora_user
+ORACLE_PASS=your_ora_pass
+ORACLE_HOST=ora-host
+ORACLE_PORT=1521
+ORACLE_SERVICE=ORCLPDB1
+ORACLE_SCHEMA=            # 留空则取 ORACLE_USER
+
+# ===== TiDB 连接（compare 对比 + capability 探针；TiDB 兼容 MySQL 协议）=====
+TIDB_USER=root
+TIDB_PASS=
+TIDB_HOST=tidb-host
+TIDB_PORT=4000
+TIDB_DB=test
+
+# ===== 输出目录（相对路径基于项目根，也可填绝对路径）=====
+EXPORT_DIR=exported
+CONVERTED_DIR=converted
+REPORT_DIR=reports
+
+# ===== compare 参数（M3）=====
+# 用例目录（测试语料库 cases/*.cases），warm-up 后重复 N 次取 avg/p50/p99
+CASES_DIR=
+PERF_WARMUP=3
+PERF_REPEAT=10

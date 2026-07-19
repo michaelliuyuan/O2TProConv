@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# ora2tidb —— Oracle 存储过程 → TiDB 转换工具 主入口（纯 shell）。
+# 子命令对齐设计文档 §3：
+#   export     需求2：配 Oracle 连接 → 拉存储过程定义 → 导出 .sql
+#   convert    需求3：Oracle SP → TiDB SP（+ 转换置信度报告）
+#   compare    需求4：Oracle vs TiDB 性能 + 结果一致性对比（--validate-cases 离线可用）
+#   capability M1 硬前置：对目标 TiDB 跑能力探针
+#   all        export → convert（compare 为 M3，未串入）
+#
+# 用法：ora2tidb [-c config] <子命令> [子参数...]   （-c 可放在子命令前或后）
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+LIB_DIR="$ROOT_DIR/lib"
+CONFIG_PATH="${CONFIG_PATH:-$ROOT_DIR/ora2tidb.conf}"
+
+# shellcheck source=../lib/common.sh
+source "$LIB_DIR/common.sh"
+
+# 默认输出目录（可被配置覆盖），命名对齐设计文档 §3
+EXPORT_DIR="${EXPORT_DIR:-$ROOT_DIR/exported}"
+CONVERTED_DIR="${CONVERTED_DIR:-$ROOT_DIR/converted}"
+REPORT_DIR="${REPORT_DIR:-$ROOT_DIR/reports}"
+
+usage() {
+  sed -n '2,10p' "${BASH_SOURCE[0]}"
+  exit 1
+}
+
+main() {
+  local cfg="" cmd=""
+  local -a subargs=()
+  # 全局 -c 可出现在任意位置；第一个非选项 token = 子命令，其余为子参数透传。
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -c|--config) cfg="${2:-}"; [[ -n "$cfg" ]] || die "-c 缺少参数"; shift 2 ;;
+      -h|--help)   usage ;;
+      *)           if [[ -z "$cmd" ]]; then cmd="$1"; else subargs+=("$1"); fi; shift ;;
+    esac
+  done
+  [[ -n "$cmd" ]] || usage
+  [[ -n "$cfg" ]] || cfg="$CONFIG_PATH"
+
+  case "$cmd" in
+    export)
+      load_config "$cfg"; source "$LIB_DIR/export_oracle.sh"; run_export ;;
+    convert)
+      load_config "$cfg"; source "$LIB_DIR/convert.sh"; run_convert ;;
+    compare)
+      # --validate-cases 离线校验，不需要 DB 连接 / 配置；其余 compare 待 M3 需 config。
+      if [[ "${subargs[0]:-}" == "--validate-cases" ]]; then
+        source "$LIB_DIR/compare.sh"; run_compare "${subargs[@]}"
+      else
+        load_config "$cfg"; source "$LIB_DIR/compare.sh"; run_compare "${subargs[@]}"
+      fi ;;
+    capability)
+      "$ROOT_DIR/capability-check/run_capability_check.sh" -c "$cfg" ;;
+    all)
+      load_config "$cfg"
+      source "$LIB_DIR/export_oracle.sh"; run_export
+      source "$LIB_DIR/convert.sh";       run_convert
+      info "all 完成（compare 为 M3，未串入）"
+      ;;
+    *) usage ;;
+  esac
+}
+
+main "$@"

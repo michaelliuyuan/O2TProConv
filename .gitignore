@@ -1,0 +1,5 @@
+exported/
+converted/
+reports/
+ora2tidb.conf
+*.log
