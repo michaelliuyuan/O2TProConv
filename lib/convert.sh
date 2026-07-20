@@ -68,7 +68,7 @@ run_convert() {
           pkg_base="$(basename "$pkg_sp" .sql)"
           pkg_out="$CONVERTED_DIR/${pkg_base}.tidb.sql"
           convert_one "$pkg_sp" "$pkg_out"
-          pkg_todos=$(grep -c '^-- TODO(' "$pkg_out" || true)
+          pkg_todos=$(grep -cE '^[[:space:]]*--[[:space:]]*TODO\(' "$pkg_out" || true)
           [[ "$pkg_todos" -gt 0 ]] && _collect_todos "$pkg_out" "$pkg_base"
           total=$((total+1))
           if ! grep -qE '^CREATE[[:space:]]+(PROCEDURE|FUNCTION)' "$pkg_out"; then
@@ -84,7 +84,7 @@ run_convert() {
         # PACKAGE BODY 拆分失败 → 原样转换（产出 defensive check 失败）
         out="$CONVERTED_DIR/${base}.tidb.sql"
         convert_one "$f" "$out"
-        todos=$(grep -c '^-- TODO(' "$out" || true)
+        todos=$(grep -cE '^[[:space:]]*--[[:space:]]*TODO\(' "$out" || true)
         [[ "$todos" -gt 0 ]] && _collect_todos "$out" "$base"
         total=$((total+1)); failed=$((failed+1))
         printf '| %s | %s | %s |\n' "$base" "⚠️ PACKAGE BODY 拆分失败，需人工" "$todos" >>"$report"
@@ -95,7 +95,7 @@ run_convert() {
 
     out="$CONVERTED_DIR/${base}.tidb.sql"
     convert_one "$f" "$out"
-    todos=$(grep -c '^-- TODO(' "$out" || true)
+    todos=$(grep -cE '^[[:space:]]*--[[:space:]]*TODO\(' "$out" || true)
     [[ "$todos" -gt 0 ]] && _collect_todos "$out" "$base"
     total=$((total+1))
     # defensive check（@架构师 建议，非静默）：输出缺 CREATE PROCEDURE|FUNCTION = parse 不了的头部结构
@@ -808,9 +808,9 @@ _mark_complex() {
       if ($0 ~ /DBMS_OUTPUT/)                    todo("DBMS_OUTPUT 需改 SELECT 结果 / 写日志表")
       if ($0 ~ /(^|[^A-Za-z0-9_])GOTO[ \t]+[A-Za-z_]/) todo("GOTO 语句 MySQL 不支持，需改写为 IF/LOOP/LEAVE 控制流")
       if ($0 ~ /<<[A-Za-z_][A-Za-z0-9_]*>>/) todo("GOTO 标签 <<label>> MySQL 不支持，需配合 GOTO 改写移除")
-      # 注：EXCEPTION 块（WHEN NO_DATA_FOUND/OTHERS）/ 显式游标 CURSOR..IS / 数值 FOR..IN / 游标 FOR rec IN cur LOOP
-      # 现由 _restructure 自动转换（EXIT handler / DECLARE..CURSOR FOR + done / WHILE+计数器 / OPEN+FETCH+CLOSE）；
-      # REVERSE FOR 在 _restructure 内单独标 TODO。此处不再标 FOR/EXCEPTION/CURSOR，避免残留假阳性。
+      # 注：EXCEPTION 块（WHEN NO_DATA_FOUND/OTHERS）/ 显式游标 CURSOR..IS / 数值 FOR..IN / 游标 FOR rec IN cur LOOP / REVERSE FOR
+      # 现由 _restructure 自动转换（EXIT handler / DECLARE..CURSOR FOR + done / WHILE+计数器 / OPEN+FETCH+CLOSE / WHILE 递减）；
+      # 非 REVERSE 数值范围外的 FOR..IN 在 _restructure 内单独标 TODO。此处不再标 FOR/EXCEPTION/CURSOR，避免残留假阳性。
       print
     }
   '
@@ -1059,10 +1059,11 @@ _restructure() {
         if (block_depth > 0) { bodybuf=bodybuf "-- TODO(需人工转换): 嵌套 EXCEPTION 块\n"; next }
         state="exception"; exc_curr=""; next
       }
-      if (line ~ /^[ \t]*END[ \t]+LOOP/) {                                     # END LOOP：FOR→SET 计数器+1 + END WHILE；CFOR→END LOOP + CLOSE；WHILE→END WHILE；LOOP→保留
+      if (line ~ /^[ \t]*END[ \t]+LOOP/) {                                     # END LOOP：FOR→+1 / RFOR→-1 / CFOR→CLOSE / WHILE→END WHILE / LOOP→保留
         ind=getindent(line)
         if (ltop>0) {
           if (ltype[ltop]=="FOR")      bodybuf=bodybuf ind "    SET " lvar[ltop] " = " lvar[ltop] " + 1;\n" ind "END WHILE " llabel[ltop] ";\n"
+          else if (ltype[ltop]=="RFOR") bodybuf=bodybuf ind "    SET " lvar[ltop] " = " lvar[ltop] " - 1;\n" ind "END WHILE " llabel[ltop] ";\n"
           else if (ltype[ltop]=="CFOR") bodybuf=bodybuf ind "END LOOP " llabel[ltop] ";\n" ind "CLOSE " lcursor[ltop] ";\n"
           else if (ltype[ltop]=="WHILE") { l=line; sub(/LOOP/, "WHILE", l); bodybuf=bodybuf l "\n" }
           else                          bodybuf=bodybuf line "\n"
@@ -1096,7 +1097,18 @@ _restructure() {
         bodybuf=bodybuf ind "    FETCH " cname " INTO " fvar "; -- TODO(需人工转换): MySQL 无 RECORD 类型，须展开为标量变量列表（按游标 SELECT 列序）\n"
         bodybuf=bodybuf ind "    IF done = 1 THEN LEAVE " lbl ";\n" ind "    END IF;\n"; next
       }
-      if (line ~ /^[ \t]*FOR[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IN[ \t]+REVERSE[ \t]+/) {       # REVERSE FOR → TODO
+      if (line ~ /^[ \t]*FOR[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IN[ \t]+REVERSE[ \t]+[0-9]+[ \t]*\.\.[ \t]*[^ \t]+[ \t]+LOOP[ \t]*$/) {
+        # REVERSE FOR v IN REVERSE lo..hi LOOP → lbl: WHILE v >= lo DO（计数器 v 初始化=hi，递减）
+        ind=getindent(line); core=substr(line,length(ind)+1)
+        sub(/^FOR[ \t]+/,"",core); fvar=core; sub(/[ \t]+IN.*$/,"",fvar)
+        sub(/^[A-Za-z_][A-Za-z0-9_]*[ \t]+IN[ \t]+REVERSE[ \t]+/,"",core)          # core = "lo..hi LOOP"
+        dd=index(core,".."); lo=substr(core,1,dd-1); gsub(/[ \t]+$/,"",lo)
+        hi=substr(core,dd+2); sub(/^[ \t]+/,"",hi); sub(/[ \t]+LOOP[ \t]*$/,"",hi)
+        for_lo[fvar]=hi   # REVERSE：计数器从 hi 开始递减
+        lbl=newlabel(); ltop++; ltype[ltop]="RFOR"; llabel[ltop]=lbl; lvar[ltop]=fvar; llo[ltop]=lo
+        bodybuf=bodybuf ind lbl ": WHILE " fvar " >= " lo " DO\n"; next
+      }
+      if (line ~ /^[ \t]*FOR[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IN[ \t]+REVERSE[ \t]+/) {       # REVERSE FOR 非数值范围 → TODO
         bodybuf=bodybuf line "\t-- TODO(需人工转换): REVERSE FOR..IN 需改 WHILE 递减（hi→lo）\n"; next
       }
       if (line ~ /^[ \t]*FOR[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IN[ \t]+/) {       # 其他 FOR..IN（无法识别）→ TODO
@@ -1111,16 +1123,18 @@ _restructure() {
         lbl=newlabel(); ltop++; ltype[ltop]="LOOP"; llabel[ltop]=lbl
         ind=getindent(line); bodybuf=bodybuf ind lbl ": LOOP\n"; next
       }
-      if (line ~ /^[ \t]*CONTINUE[ \t]*;/) {                                   # CONTINUE; → ITERATE label（FOR 内先递增计数器防死循环；允许行尾 -- 注释）
+      if (line ~ /^[ \t]*CONTINUE[ \t]*;/) {                                   # CONTINUE; → ITERATE label（FOR/RFOR 内先递增/递减计数器防死循环）
         ind=getindent(line); lbl=(ltop>0?llabel[ltop]:"lp1")
         if (ltop>0 && ltype[ltop]=="FOR") bodybuf=bodybuf ind "SET " lvar[ltop] " = " lvar[ltop] " + 1;\n"
+        if (ltop>0 && ltype[ltop]=="RFOR") bodybuf=bodybuf ind "SET " lvar[ltop] " = " lvar[ltop] " - 1;\n"
         bodybuf=bodybuf ind "ITERATE " lbl ";\n"; next
       }
-      if (line ~ /^[ \t]*CONTINUE[ \t]+WHEN[ \t]+/) {                         # CONTINUE WHEN cond → IF cond THEN (SET+1)? ITERATE
+      if (line ~ /^[ \t]*CONTINUE[ \t]+WHEN[ \t]+/) {                         # CONTINUE WHEN cond → IF cond THEN (SET±1)? ITERATE
         ind=getindent(line); core=line; sub(/^[ \t]*CONTINUE[ \t]+WHEN[ \t]+/,"",core); sub(/;[ \t]*$/,"",core)
         lbl=(ltop>0?llabel[ltop]:"lp1")
         bodybuf=bodybuf ind "IF " core " THEN\n"
         if (ltop>0 && ltype[ltop]=="FOR") bodybuf=bodybuf ind "    SET " lvar[ltop] " = " lvar[ltop] " + 1;\n"
+        if (ltop>0 && ltype[ltop]=="RFOR") bodybuf=bodybuf ind "    SET " lvar[ltop] " = " lvar[ltop] " - 1;\n"
         bodybuf=bodybuf ind "    ITERATE " lbl ";\n" ind "END IF;\n"; next
       }
       if (line ~ /^[ \t]*EXIT[ \t]+WHEN[ \t]+/) {                              # EXIT WHEN c%NOTFOUND → IF done=1 THEN LEAVE
