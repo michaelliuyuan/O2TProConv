@@ -36,7 +36,12 @@
 
 ## 依赖
 
-bash ≥ 4；Oracle 侧 `sqlplus`/`sqlcl`；TiDB 侧 `mysql`；GNU `sed`/`gawk`；可选 `bc`/`jq`。
+bash ≥ 4；Oracle 侧 `sqlplus`/`sqlcl`；TiDB 侧 `mysql`；**GNU `sed`/`gawk`**；可选 `bc`/`jq`。
+
+> **工具链校验**：convert/compare 启动时会自动校验 `sed`/`awk` 是 GNU 版本（`require_gnu_sed`/`require_gawk`）：
+> - **GNU sed**：脚本依赖 `-E` 扩展正则、`\b` 词边界等 GNU 特性。BSD sed（macOS 默认）行为有差异且不支持 `\b`，会**静默产出错误结果**——校验不通过会 `die` 并提示 `brew install gnu-sed`。
+> - **gawk 优先策略**：PATH 有 `gawk` 直接用之；否则校验 `awk` 指向 GNU Awk（多数 Linux 发行版 `awk` 即 `gawk`）。macOS 默认 `awk` 非 gawk，需 `brew install gawk`。
+> - convert 重度依赖 GNU sed + gawk；compare 多处用 awk（仅校验 gawk）。export/capability 不依赖这两个工具。
 
 ## 目录结构
 
@@ -66,7 +71,11 @@ oracle2tidb-sp/
 ```bash
 bash --version | head -1                 # bash ≥ 4
 command -v sqlplus mysql sed awk          # Oracle/TiDB 客户端 + GNU 工具
+sed --version | head -1                   # 须含 'GNU sed'（BSD sed 会静默错，macOS 需 brew install gnu-sed）
+awk --version | head -1                   # 须含 'GNU Awk'（或 PATH 有 gawk；macOS 需 brew install gawk）
 ```
+
+> convert/compare 启动时会自动做上述 GNU 版本校验，不通过直接 `die`，避免 BSD 工具链静默产出错误结果。
 
 ### 1. 配置连接
 
@@ -350,6 +359,18 @@ DELIMITER ;
 - PACKAGE 级游标 → 迁移到使用它的子程序内
 
 PACKAGE spec（声明部分）目前只导出不自动转换。
+
+### Q: macOS 上跑 convert/compare 报「sed 非 GNU 版本」/「awk 非 GNU Awk」？
+
+macOS 默认的 `sed`/`awk` 是 BSD 版本，不支持 GNU 的 `-E` 扩展、`\b` 词边界、gawk 动态正则等特性——脚本会**静默产出错误结果**而非报错，因此 convert/compare 启动时强制校验 GNU 版本。安装 GNU 版本即可：
+
+```bash
+brew install gnu-sed gawk
+# 默认装到 keg-only 路径，需加 PATH（或用 --with-default-names 选项，视 brew 版本）
+export PATH="$(brew --prefix)/opt/gnu-sed/libexec/gnubin:$(brew --prefix)/opt/gawk/libexec/gnubin:$PATH"
+```
+
+Linux 多数发行版 `sed`/`awk` 已是 GNU 版本，无需额外操作。
 
 ### Q: 嵌套 DECLARE..BEGIN..END 能自动转换吗？
 
