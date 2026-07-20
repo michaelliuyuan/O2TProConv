@@ -10,6 +10,9 @@
 set -euo pipefail
 
 run_convert() {
+  # convert 重度依赖 GNU sed（-E/\b）和 gawk（动态正则/字段分隔），启动时校验避免静默错误产出。
+  require_gnu_sed
+  require_gawk
   : "${ORACLE_DIR:=$EXPORT_DIR}"
   resolve_dir ORACLE_DIR
   resolve_dir CONVERTED_DIR

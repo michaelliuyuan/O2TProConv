@@ -32,6 +32,28 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "缺少依赖命令: $1（请先安装并加入 PATH）"
 }
 
+# 校验 sed 是 GNU sed（脚本用 -E 扩展正则、\b 词边界等 GNU/BSD 扩展特性）。
+# BSD sed（macOS 默认）的 -E 行为有细微差且不支持 \b，会静默产出错误结果。
+require_gnu_sed() {
+  command -v sed >/dev/null 2>&1 || die "缺少依赖命令: sed"
+  if ! sed --version 2>&1 | grep -qi 'GNU sed'; then
+    die "sed 非 GNU 版本（当前：$(sed --version 2>&1 | head -1)）。脚本依赖 GNU sed 的 -E/\\b 等扩展，macOS 需 brew install gnu-sed"
+  fi
+}
+
+# 校验 awk 是 GNU awk（gawk）。
+# 脚本多处用 `awk`，一处显式 `gawk`（convert.sh:251），依赖 gawk 的字段分隔/动态正则等扩展。
+# 策略：优先用 gawk；若不存在则要求 awk 指向 GNU Awk（多数 Linux 发行版 awk 即 gawk）。
+require_gawk() {
+  if command -v gawk >/dev/null 2>&1; then
+    return 0
+  fi
+  command -v awk >/dev/null 2>&1 || die "缺少依赖命令: awk/gawk（请安装 gawk）"
+  if ! awk --version 2>&1 | grep -qi 'GNU Awk'; then
+    die "awk 非 GNU Awk(gawk)（当前：$(awk --version 2>&1 | head -1)）。脚本依赖 gawk 扩展，macOS 需 brew install gawk"
+  fi
+}
+
 # ---------- Oracle 连接串 ----------
 # 形如 user/pass@//host:port/service
 # 注意：口令含 / @ # 等特殊字符时该形式可能失效，需用钱包/转义，见 README。

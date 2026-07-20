@@ -203,6 +203,7 @@ run_exec() {
   : "${CASES_DIR:?compare 需 CASES_DIR（ora2tidb.conf）}"
   [[ -d "$CASES_DIR" ]] || die "CASES_DIR 不存在: $CASES_DIR"
   require_cmd sqlplus mysql awk
+  require_gawk
   resolve_dir REPORT_DIR; mkdir -p "$REPORT_DIR"
   # pre-compare 序列重置：COMPARE_RESET_SEQUENCES=seq1,seq2 两端 DROP/CREATE SEQUENCE 同起点
   if [[ -n "${COMPARE_RESET_SEQUENCES:-}" ]]; then
@@ -325,6 +326,7 @@ validate_cases() {
   [[ -n "$dir" ]] || die "用法: ora2tidb compare --validate-cases <cases 目录> [--spec test-cases.md]"
   [[ -d "$dir" ]] || die "用例目录不存在: $dir"
   require_cmd awk
+  require_gawk
 
   # ---- ① 格式校验（逐 .cases 文件）----
   shopt -s nullglob
