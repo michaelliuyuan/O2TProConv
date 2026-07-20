@@ -9,6 +9,26 @@
 #     例如 MySQL 中 || 默认是逻辑或而非拼接，静默不转即语义错误，故必须标记。
 set -euo pipefail
 
+# 收集转换输出中的 TODO 明细（文件名 + 行号 + 原因），追加到全局 todo_section。
+# 用法：_collect_todos <output_file> <base_name>
+# 格式：- **base**（输出文件:L行号）：reason
+_collect_todos() {
+  local out_file="$1" base="$2"
+  local todo_lines
+  todo_lines="$(grep -nE '^--[[:space:]]*TODO\(' "$out_file" 2>/dev/null || true)"
+  [[ -z "$todo_lines" ]] && return 0
+  local lineno reason
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    lineno="${line%%:*}"
+    reason="${line#*:}"
+    # 去掉前导 "-- TODO(...): " 前缀，保留纯原因文本
+    reason="${reason#*): }"
+    [[ -z "${reason// }" ]] && reason="(未标注原因)"
+    todo_section+="- **${base}**（${out_file##*/}:L${lineno}）：${reason}"$'\n'
+  done <<<"$todo_lines"
+}
+
 run_convert() {
   # convert 重度依赖 GNU sed（-E/\b）和 gawk（动态正则/字段分隔），启动时校验避免静默错误产出。
   require_gnu_sed
@@ -32,7 +52,7 @@ run_convert() {
 
   shopt -s nullglob
   local f base out todos status total=0 need_review=0 failed=0
-  local note_section="" sem_section="" tmpdir
+  local note_section="" sem_section="" todo_section="" tmpdir
   tmpdir="$(mktemp -d)"
   for f in "$ORACLE_DIR"/*.sql; do
     [[ "$(basename "$f")" == _* ]] && continue      # 跳过 _proc_list.tsv 等辅助文件
@@ -48,6 +68,7 @@ run_convert() {
           pkg_out="$CONVERTED_DIR/${pkg_base}.tidb.sql"
           convert_one "$pkg_sp" "$pkg_out"
           pkg_todos=$(grep -c '^-- TODO(' "$pkg_out" || true)
+          [[ "$pkg_todos" -gt 0 ]] && _collect_todos "$pkg_out" "$pkg_base"
           total=$((total+1))
           if ! grep -qE '^CREATE[[:space:]]+(PROCEDURE|FUNCTION)' "$pkg_out"; then
             printf '| %s | %s | %s |\n' "$pkg_base" "⚠️ 转换失败/空输出（头部 parse 不了？）需人工" "0" >>"$report"; failed=$((failed+1))
@@ -63,6 +84,7 @@ run_convert() {
         out="$CONVERTED_DIR/${base}.tidb.sql"
         convert_one "$f" "$out"
         todos=$(grep -c '^-- TODO(' "$out" || true)
+        [[ "$todos" -gt 0 ]] && _collect_todos "$out" "$base"
         total=$((total+1)); failed=$((failed+1))
         printf '| %s | %s | %s |\n' "$base" "⚠️ PACKAGE BODY 拆分失败，需人工" "$todos" >>"$report"
         log "  $base → $out（PACKAGE BODY 拆分失败）"
@@ -73,6 +95,7 @@ run_convert() {
     out="$CONVERTED_DIR/${base}.tidb.sql"
     convert_one "$f" "$out"
     todos=$(grep -c '^-- TODO(' "$out" || true)
+    [[ "$todos" -gt 0 ]] && _collect_todos "$out" "$base"
     total=$((total+1))
     # defensive check（@架构师 建议，非静默）：输出缺 CREATE PROCEDURE|FUNCTION = parse 不了的头部结构
     # （如 inline-decl `AS v_x TYPE;` 单行）→ SP 整个消失是 silent failure，比语义边更重。标失败 + 计数。
@@ -133,6 +156,16 @@ run_convert() {
       printf '%s' "$sem_section"
     else
       echo "无语义差异（或未使用 SYS_GUID / MONTHS_BETWEEN / NVL2 / DATE 类型）。"
+    fi
+    echo
+    echo "## TODO 明细（需人工转换项，按文件+行号定位）"
+    echo
+    if [[ -n "$todo_section" ]]; then
+      echo "下列行被标记 \`-- TODO(需人工转换)\`——正则无法可靠转换，需人工处理。定位格式：\`输出文件:L行号\`。"
+      echo
+      printf '%s' "$todo_section"
+    else
+      echo "无 TODO 标记（所有结构均自动转换）。"
     fi
   } >>"$report"
 
