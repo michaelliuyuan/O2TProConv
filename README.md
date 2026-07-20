@@ -43,6 +43,8 @@ bash ≥ 4；Oracle 侧 `sqlplus`/`sqlcl`；TiDB 侧 `mysql`；**GNU `sed`/`gawk
 > - **gawk 优先策略**：PATH 有 `gawk` 直接用之；否则校验 `awk` 指向 GNU Awk（多数 Linux 发行版 `awk` 即 `gawk`）。macOS 默认 `awk` 非 gawk，需 `brew install gawk`。
 > - convert 重度依赖 GNU sed + gawk；compare 多处用 awk（仅校验 gawk）。export/capability 不依赖这两个工具。
 
+> **`%TYPE` 锚定类型解析（schema 内省）**：export 阶段会额外拉 `all_tab_columns`（owner/table_name/column_name/data_type/data_length/data_precision/data_scale/nullable）→ `exported/_schema_columns.tsv`，convert 的 `_resolve_anchor_type` pass 据此将 `table.column%TYPE` 解析为具体类型。**离线 fallback**：无 Oracle 连接（仅 convert 已导出文件）或列未匹配时，`%TYPE` 降级回 `-- TODO`（不臆造，保「离线可用」）。需要 export 用户对 `all_tab_columns` 有 SELECT 权限。
+
 ## 目录结构
 
 ```
@@ -373,6 +375,16 @@ DELIMITER ;
 - PACKAGE 级游标 → 迁移到使用它的子程序内
 
 PACKAGE spec（声明部分）目前只导出不自动转换。
+
+### Q: `%TYPE` 锚定类型（如 `v_sal emp.salary%TYPE`）能自动转换吗？
+
+能（需 export 阶段已拉 schema 列定义）。export 阶段会额外导出 `all_tab_columns` → `exported/_schema_columns.tsv`，convert 的 `_resolve_anchor_type` pass 据此将 `table.column%TYPE` 解析为具体类型（复用机械层类型映射规则：`VARCHAR2`→`VARCHAR(length)`、`NUMBER(p,s)`→`DECIMAL(p,s)`、裸 `NUMBER`→`DECIMAL(65,30)`）。`column%TYPE`（同包变量锚定）先查本地 symtab，无则查 schema。
+
+**离线 fallback**：若 `exported/_schema_columns.tsv` 不存在（如只跑 convert 已导出文件、无 Oracle 连接）或列未匹配，`%TYPE` 降级回 `-- TODO(需人工转换)` 并进报告明细——不臆造，保「离线可用」特性。
+
+**权限要求**：export 用户需对 `all_tab_columns` 有 SELECT 权限（通常 DBA/迁移账号已具备）。
+
+> `%ROWTYPE`（如 `v_emp emp%ROWTYPE`，多字段 RECORD）不在 `%TYPE` 范围内，需扩为多字段结构，标 TODO 走人工（见 P2）。
 
 ### Q: macOS 上跑 convert/compare 报「sed 非 GNU 版本」/「awk 非 GNU Awk」？
 
