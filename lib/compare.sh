@@ -38,12 +38,12 @@ _cmp_parse() {
     /^[ \t]*$/  { next }
     /^[ \t]*in[ \t]/  { v=$0; sub(/^[ \t]*in[ \t]+/,"",v);
                        n=split(v,ka,/[ \t]+/); for(i=1;i<=n;i++) if(ka[i]!="") args =(args ==""?"":args ";") "in:" ka[i] }
+    # out：一参一行（name=值，值=首 = 后整行——可含空格/正则）；多 OUT 参须每参一行（@测试 corpus 约定）。
+    # 不按空白拆（Bug 5：sp_format_report 的 ~regex 值含空格，空白拆会造幻影 OUT 参）。
     /^[ \t]*out[ \t]/ { v=$0; sub(/^[ \t]*out[ \t]+/,"",v);
-                       n=split(v,oa,/[ \t]+/); for(i=1;i<=n;i++) if(oa[i]!="") {
-                         ov=oa[i]; on=ov; sub(/=.*$/,"",on);
-                         args =(args ==""?"":args ";") "out:" on;
-                         outexp=(outexp==""?"":outexp ";") ov
-                       } }
+                       nm=v; sub(/=.*$/,"",nm);
+                       args =(args ==""?"":args ";") "out:" nm;
+                       outexp=(outexp==""?"":outexp ";") v }
     /^[ \t]*norm[ \t]/{ v=$0; sub(/^[ \t]*norm[ \t]+/,"",v); norm=(norm==""?"":norm " ") v }
     /^[ \t]*perf[ \t]/{ v=$0; sub(/^[ \t]*perf[ \t]+/,"",v); perf=(perf==""?"":perf " ") v }
     END { flush() }
@@ -206,19 +206,18 @@ run_exec() {
       local tsql osql tout oout
       tsql="$(_cmp_gen_tidb "$sp" "$capture" "$args")"
       osql="$(_cmp_gen_oracle "$sp" "$capture" "$args")"
-      # TiDB 执行 + 抓 OUT
-      if tout="$(printf '%s\n%s\n' "USE $TIDB_DB;" "$tsql" | mysql_tidb 2>&1)"; then :; else pass="❌ TiDB执行错"; fi
+      # TiDB 执行 + 抓 OUT（-B -N：batch tab-separated、无表头 → 列按 tab 拆，DATETIME 带空格不错位）
+      if tout="$(printf '%s\n%s\n' "USE $TIDB_DB;" "$tsql" | mysql_tidb -B -N 2>&1)"; then :; else pass="❌ TiDB执行错"; fi
       # Oracle 执行 + 抓 OUT（sqlplus）
       oout="$(printf '%s\n%s\n' "WHENEVER OSERROR EXIT;" "$osql" | sqlplus -S "$(oracle_connect)" 2>&1)" || pass="❌ Oracle执行错"
       # 值级 diff（outexp 形如 "p_bonus=750;p_label=A_<DATE:YYYYMMDD>"，按 ; 分项）
       if [[ "$pass" == "✅" && -n "$outexp" ]]; then
         local IFS=';' oe exp_name exp_val
-        # TiDB 输出按列取（outexp 顺序 = args 里 out 顺序）
-        local ncols; ncols="$(printf '%s' "$tout" | awk 'NR==2{print NF}' 2>/dev/null)"
+        # TiDB 输出按列取（outexp 顺序 = args 里 out 顺序）；-B -N → tab-separated 首行数据
         local i=0
         for oe in $outexp; do
           exp_name="${oe%%=*}"; exp_val="${oe#*=}"
-          local actval; actval="$(printf '%s' "$tout" | awk -v c=$((i+1)) 'NR==2{print $c}')"
+          local actval; actval="$(printf '%s' "$tout" | awk -F'\t' -v c=$((i+1)) 'NR==1{print $c}')"
           if ! _cmp_diff "$exp_val" "$actval" "$norm" "$exp_name"; then pass="❌ $exp_name: 期望[$exp_val] 实际[$actval]"; break; fi
           i=$((i+1))
         done
