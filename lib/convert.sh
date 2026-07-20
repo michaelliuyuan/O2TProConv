@@ -1172,9 +1172,15 @@ _restructure() {
         if (ltop>0 && ltype[ltop]=="RFOR") bodybuf=bodybuf ind "    SET " lvar[ltop] " = " lvar[ltop] " - 1;\n"
         bodybuf=bodybuf ind "    ITERATE " lbl ";\n" ind "END IF;\n"; next
       }
-      if (line ~ /^[ \t]*EXIT[ \t]+WHEN[ \t]+/) {                              # EXIT WHEN c%NOTFOUND → IF done=1 THEN LEAVE
+      if (line ~ /^[ \t]*EXIT[ \t]+WHEN[ \t]+/) {                              # EXIT WHEN cond → IF cond THEN LEAVE
+        # Bug #6 修复：原逻辑若含 %NOTFOUND 则整体替换为 done=1，丢弃复合条件（OR v_count >= 3）。
+        # 正确做法：仅将 cursor%NOTFOUND 标记替换为 done=1，保留其余条件。
         ind=getindent(line); core=line; sub(/^[ \t]*EXIT[ \t]+WHEN[ \t]+/,"",core); sub(/;[ \t]*$/,"",core)
-        cond = (core ~ /[A-Za-z_][A-Za-z0-9_]*%NOTFOUND/ ? "done = 1" : core)
+        # 替换所有 cursor_name%NOTFOUND → done = 1
+        while (match(core, /[A-Za-z_][A-Za-z0-9_]*%NOTFOUND/)) {
+          core = substr(core,1,RSTART-1) "done = 1" substr(core,RSTART+RLENGTH)
+        }
+        cond=core
         lbl=(ltop>0?llabel[ltop]:"lp1")
         bodybuf=bodybuf ind "IF " cond " THEN\n" ind "    LEAVE " lbl ";\n" ind "END IF;\n"; next
       }
