@@ -969,9 +969,11 @@ _restructure() {
       return gensub(/^([ \t]*)([A-Za-z_][A-Za-z0-9_.]*)[ \t]*:=[ \t]*/, "\\1SET \\2 = ", "g", line)
     }
     # 组装：header(DROP+CREATE+params) → BEGIN → 变量(+done/v_errmsg) → 游标 → handler → body → END
-    function assemble(    h, vn, vl, i, vline, vname) {
+    function assemble(    h, vn, vl, i, vline, vname, _seen, _k) {
       printf "%s", hdrbuf
       print "BEGIN"
+      # 收集 varbuf 中已声明的变量名，用于检测 FOR 计数器是否隐式声明
+      split("", _seen)
       if (varbuf != "") {
         vn=split(varbuf, vl, "\n")
         for(i=1;i<=vn;i++){
@@ -979,10 +981,15 @@ _restructure() {
           # 若声明的是数值 FOR 计数器变量 → 改 INT DEFAULT <lo>（计数器为整数、初值=FOR 下界）
           if (vline ~ /^DECLARE[ \t]+[A-Za-z_][A-Za-z0-9_]*/) {
             vname=vline; sub(/^DECLARE[ \t]+/,"",vname); sub(/[ \t].*$/,"",vname)
+            _seen[vname]=1
             if (vname in for_lo) vline="DECLARE " vname " INT DEFAULT " for_lo[vname] ";"
           }
           print vline
         }
+      }
+      # 注入隐式声明的 FOR 计数器变量（Oracle FOR v IN lo..hi 中 v 未在 DECLARE 段显式声明）
+      for (_k in for_lo) {
+        if (!(_k in _seen)) printf "    DECLARE %s INT DEFAULT %s;\n", _k, for_lo[_k]
       }
       if (done_needed)   print "    DECLARE done INT DEFAULT 0;"
       if (has_others)    print "    DECLARE v_errmsg VARCHAR(255);"
