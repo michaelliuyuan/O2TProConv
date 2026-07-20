@@ -29,7 +29,7 @@ run_convert() {
 
   shopt -s nullglob
   local f base out todos status total=0 need_review=0
-  local note_section=""
+  local note_section="" sem_section=""
   for f in "$ORACLE_DIR"/*.sql; do
     [[ "$(basename "$f")" == _* ]] && continue      # 跳过 _proc_list.tsv 等辅助文件
     base="$(basename "$f" .sql)"
@@ -51,6 +51,15 @@ run_convert() {
       [[ "$dc" -gt 0 ]] && note_line+="DECIMAL(65,30)×${dc}"
       note_section+="${note_line}"$'\n'
     fi
+    # 语义差异 NOTE（@架构师 复核：下列函数已自动转但有已知语义差，需核对）——扫源文件 Oracle 函数名。
+    local sg mb n2 sem_line=""
+    sg=$(grep -cE '(^|[^A-Za-z0-9_])SYS_GUID[[:space:]]*\(' "$f" || true)
+    mb=$(grep -cE '(^|[^A-Za-z0-9_])MONTHS_BETWEEN[[:space:]]*\(' "$f" || true)
+    n2=$(grep -cE '(^|[^A-Za-z0-9_])NVL2[[:space:]]*\(' "$f" || true)
+    [[ "$sg" -gt 0 ]] && sem_line+="SYS_GUID→UUID(Oracle 32-hex 无连字符 vs MySQL 36 带连字符)×${sg}；"
+    [[ "$mb" -gt 0 ]] && sem_line+="MONTHS_BETWEEN→TIMESTAMPDIFF(Oracle 小数月 vs MySQL 整数月截断)×${mb}；"
+    [[ "$n2" -gt 0 ]] && sem_line+="NVL2→IF(Oracle ''≡NULL vs MySQL ''≠NULL，空串路径分歧)×${n2}；"
+    [[ -n "$sem_line" ]] && sem_section+="  - **$base**：${sem_line}"$'\n'
     log "  $base → $out（TODO: $todos）"
   done
   shopt -u nullglob
@@ -70,6 +79,16 @@ run_convert() {
       echo "- DECIMAL(65,30)：裸 NUMBER → DECIMAL(65,30) 安全兜底（不做列精度推断）；高 scale NUMBER 有截断风险，请人工核对。"
     else
       echo "无默认填充（所有 VARCHAR2/NUMBER 均带显式长度/精度）。"
+    fi
+    echo
+    echo "## 语义差异 NOTE（已自动转换但有已知差异，需核对）"
+    echo
+    if [[ -n "$sem_section" ]]; then
+      echo "下列函数已自动转换，但 Oracle↔MySQL 存在已知语义差——若 SP 依赖被转换方语义（比较/截取/proration/空串），需人工核对："
+      echo
+      printf '%s' "$sem_section"
+    else
+      echo "无语义差异函数（或未使用 SYS_GUID / MONTHS_BETWEEN / NVL2）。"
     fi
   } >>"$report"
 

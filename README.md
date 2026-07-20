@@ -300,8 +300,9 @@ DELIMITER ;
 
 **自动转换（机械 + 结构 + 忠实语义）**：
 - 类型：`VARCHAR2→VARCHAR`、`NVARCHAR2→NVARCHAR`（裸类型给安全默认长度 `VARCHAR(4000)`）、`NUMBER(p,s)→DECIMAL(p,s)`、裸 `NUMBER→DECIMAL(65,30)`、`PLS_INTEGER/BINARY_INTEGER→INT`
-- 内置：`NVL→IFNULL`、`SYSDATE→NOW()`、`SYSTIMESTAMP→CURRENT_TIMESTAMP(6)`、`TO_CHAR(date,'mask')→DATE_FORMAT`、`ELSIF→ELSEIF`
+- 内置：`NVL→IFNULL`、`SYSDATE→NOW()`、`SYSTIMESTAMP→CURRENT_TIMESTAMP(6)`、`TO_CHAR(date,'mask')→DATE_FORMAT`、`TO_DATE(str,'mask')→STR_TO_DATE`、`LENGTH→CHAR_LENGTH`、`CHR→CHAR`、`SYS_GUID()→UUID()`⚠️、`NVL2(a,b,c)→IF(a IS NOT NULL,b,c)`⚠️、`ADD_MONTHS(d,n)→DATE_ADD(d,INTERVAL n MONTH)`、`MONTHS_BETWEEN(a,b)→TIMESTAMPDIFF(MONTH,b,a)`⚠️参数反转、`ELSIF→ELSEIF`
 - 忠实语义：`a||b→NULLIF(CONCAT(IFNULL(a,''),IFNULL(b,'')),'')`（简单链，NULL 安全）、`DECODE(e,s1,r1,..,def)→CASE WHEN e<=>s1 THEN r1 .. ELSE def END`（`<=>` null-safe）
+- ⚠️ **语义差异 NOTE**（已转但有已知差，转换报告「语义差异 NOTE」段列出，需核对）：`SYS_GUID()→UUID()`（Oracle 32-hex 无连字符 vs MySQL 36 带连字符）、`MONTHS_BETWEEN→TIMESTAMPDIFF`（Oracle 小数月 vs MySQL 整数月截断）、`NVL2→IF`（Oracle `''≡NULL` vs MySQL `''≠NULL`，空串路径分歧）。
 - 结构：EXCEPTION 块→`EXIT HANDLER`（NO_DATA_FOUND→`FOR NOT FOUND`、OTHERS→`FOR SQLEXCEPTION`+`GET DIAGNOSTICS`+`SQLERRM→v_errmsg`）；显式游标 `CURSOR c IS`→`DECLARE c CURSOR FOR`（+done 标志 + `CONTINUE HANDLER FOR NOT FOUND` + label + `EXIT WHEN c%NOTFOUND`→`IF done=1 THEN LEAVE`）；`WHILE..LOOP`→`WHILE..DO`；数值 `FOR v IN lo..hi LOOP`→`WHILE v<=hi DO`（+计数器递增）；`CONTINUE`→`ITERATE label`（FOR 内前置递增防死循环）；`:=`→`SET`/`DEFAULT`；DECLARE 序重排（变量/条件→游标→handler）；头部 `CREATE OR REPLACE`→`DROP IF EXISTS`+`CREATE`、双引号→反引号、去 owner 前缀、`RETURN<type>→RETURNS<type>`；去 Oracle `/` 终止行；`DELIMITER //` 包裹。
 
 **自动标记 `-- TODO(需人工转换)`**：跨表达式/跨行 `||`（**Route A 下留字面交 PIPES_AS_CONCAT**，TODO 标部署要求——见 Usage Step 5）、`%TYPE/%ROWTYPE`、`EXECUTE IMMEDIATE`、`BULK COLLECT/FORALL`、`TO_CHAR(number/复杂)`、`DBMS_OUTPUT`、游标/REVERSE `FOR..IN`、`GOTO`（MySQL 不支持）、嵌套 `DECLARE..BEGIN..END`。
