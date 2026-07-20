@@ -151,7 +151,7 @@ SOURCE converted/sp_format_report.tidb.sql;
 ./bin/ora2tidb compare -c ora2tidb.conf   # 两端跑用例 → 归一化 → diff + p50/p99 加速比
 ```
 
-> M3 手动实跑真值（README 作预期产出示例）：**T1+T2 一致性 24/24 全绿（Route A）**；perf 见 `results/perf-oracle-vs-tidb.md`（信息性：Oracle PL/SQL 原生循环调用 ≈0 vs TiDB CALL ~3.5ms 固有调度底，SP-heavy OLTP 迁移需评估）。
+> M3 手动实跑真值（README 作预期产出示例）：**T1+T2 一致性 33/33 全绿（Route A，11 个 SP：T1×16 + T2×17 子例）**；perf 见 `results/perf-oracle-vs-tidb.md`（信息性：Oracle PL/SQL 原生循环调用 ≈0 vs TiDB CALL ~3.5ms 固有调度底，SP-heavy OLTP 迁移需评估）。
 
 ### 一键全流程
 
