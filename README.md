@@ -335,7 +335,7 @@ DELIMITER ;
 - ⚠️ **语义差异 NOTE**（已转但有已知差，转换报告「语义差异 NOTE」段列出，需核对）：`SYS_GUID()→UUID()`（Oracle 32-hex 无连字符 vs MySQL 36 带连字符）、`MONTHS_BETWEEN→TIMESTAMPDIFF`（Oracle 小数月 vs MySQL 整数月截断）、`NVL2→IF`（Oracle `''≡NULL` vs MySQL `''≠NULL`，空串路径分歧）。
 - 结构：EXCEPTION 块→`EXIT HANDLER`（NO_DATA_FOUND→`FOR NOT FOUND`、OTHERS→`FOR SQLEXCEPTION`+`GET DIAGNOSTICS`+`SQLERRM→v_errmsg`）；显式游标 `CURSOR c IS`→`DECLARE c CURSOR FOR`（+done 标志 + `CONTINUE HANDLER FOR NOT FOUND` + label + `EXIT WHEN c%NOTFOUND`→`IF done=1 THEN LEAVE`）；游标 `FOR rec IN c LOOP`→`OPEN c` + `label:LOOP` + `FETCH c INTO rec`（**FETCH INTO 标 TODO：MySQL 无 RECORD 类型，需人工展开为标量变量列表**）+ done check + body + `END LOOP label` + `CLOSE c`（半自动）；`EXECUTE IMMEDIATE 'sql' [USING ..]`→`SET @sql=..; PREPARE stmt FROM @sql; EXECUTE stmt [USING ..]; DEALLOCATE PREPARE stmt;`（**INTO 子句标 TODO：MySQL PREPARE 无单行 SELECT 返回，需改游标**）（半自动）；`WHILE..LOOP`→`WHILE..DO`；数值 `FOR v IN lo..hi LOOP`→`DECLARE v INT DEFAULT lo; WHILE v<=hi DO`（+计数器递增）；`FOR v IN REVERSE lo..hi LOOP`→`DECLARE v INT DEFAULT hi; WHILE v>=lo DO`（计数器递减）；`CONTINUE`→`ITERATE label`（forward FOR 内前置递增防死循环；REVERSE FOR 内前置递减防死循环；游标 FOR 内直接 ITERATE，FETCH 在循环顶自动推进）；`:=`→`SET`/`DEFAULT`；DECLARE 序重排（变量/条件→游标→handler）；头部 `CREATE OR REPLACE`→`DROP IF EXISTS`+`CREATE`、双引号→反引号、去 owner 前缀、`RETURN<type>→RETURNS<type>`；去 Oracle `/` 终止行；`DELIMITER //` 包裹；嵌套 `DECLARE..BEGIN..END`（简单块→MySQL `BEGIN..END`，含 EXCEPTION 的标 TODO）。
 
-**自动标记 `-- TODO(需人工转换)`**：跨表达式/跨行 `||`（**Route A 下留字面交 PIPES_AS_CONCAT**，TODO 标部署要求——见 Usage Step 5）、`%ROWTYPE`、未解析的 `%TYPE`（无 schema 数据或列未匹配）、`EXECUTE IMMEDIATE` 的 INTO 子句（MySQL PREPARE 无单行 SELECT 返回）、`LISTAGG OVER(PARTITION BY..)` 分析函数形式（MySQL GROUP_CONCAT 不支持）、`BULK COLLECT/FORALL`、`TO_CHAR(number/复杂)`、`DBMS_OUTPUT`、内联游标 `FOR rec IN (SELECT..)`、`GOTO`（MySQL 不支持）、嵌套 `DECLARE..BEGIN..END`（含 EXCEPTION 的复杂嵌套块）。
+**自动标记 `-- TODO(需人工转换)`**：跨表达式/跨行 `||`（**Route A 下留字面交 PIPES_AS_CONCAT**，TODO 标部署要求——见 Usage Step 5）、`%ROWTYPE`、未解析的 `%TYPE`（无 schema 数据或列未匹配）、`EXECUTE IMMEDIATE` 的 INTO 子句（MySQL PREPARE 无单行 SELECT 返回）、`LISTAGG OVER(PARTITION BY..)` 分析函数形式（MySQL GROUP_CONCAT 不支持）、`BULK COLLECT/FORALL`、`TYPE .. IS TABLE OF/RECORD/VARRAY`（PL/SQL 集合/记录类型，MySQL 无对应——BULK COLLECT 依赖的 TYPE 声明也标 TODO）、`TO_CHAR(number/复杂)`、`DBMS_OUTPUT`、内联游标 `FOR rec IN (SELECT..)`、`GOTO`（MySQL 不支持）、嵌套 `DECLARE..BEGIN..END`（含 EXCEPTION 的复杂嵌套块）。
 
 > ⚠️ **已知限制（LISTAGG OVER 跨行漏检）**：`LISTAGG OVER(PARTITION BY..)` 当 `OVER` 与 `LISTAGG(..) WITHIN GROUP(..)` 在**同一行**时正确标 TODO；当 `OVER` 在**下一行**（跨行）时，逐行处理的 `conv_listagg` 检测不到 → 静默转 `GROUP_CONCAT` 并残留孤立 `OVER (..)`（产出 MySQL 语法错误）。建议源码规范 `LISTAGG OVER` 写在同一行，或转换后人工检查残留 `OVER`。后续 `_mark_complex` 可能加跨行兜底检测。
 
@@ -455,6 +455,8 @@ Linux 多数发行版 `sed`/`awk` 已是 GNU 版本，无需额外操作。
 ### Q: 转换报告里的 `-- TODO` 是什么意思？
 
 `-- TODO` 表示转换器无法可靠自动转换该处（如 `%ROWTYPE`、`EXECUTE IMMEDIATE`、`BULK COLLECT`、跨行 `||` 等），需人工介入。详见「转换覆盖」章节的诚实边界策略。
+
+> **BULK COLLECT 的关联 TYPE 声明也标 TODO**：`BULK COLLECT INTO` 通常依赖 `TYPE .. IS TABLE OF/RECORD` 声明的集合类型，转换器会同时为 BULK COLLECT 语句和其依赖的 TYPE 声明标 TODO（MySQL 无 PL/SQL 集合/记录类型，需改临时表或 JSON）。
 
 ### Q: 性能对比结果 TiDB 比 Oracle 慢很多？
 
