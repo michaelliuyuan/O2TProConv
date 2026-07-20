@@ -333,13 +333,13 @@ DELIMITER ;
 - 内置：`NVL→IFNULL`、`SYSDATE→NOW()`、`SYSTIMESTAMP→CURRENT_TIMESTAMP(6)`、`TO_CHAR(date,'mask')→DATE_FORMAT`、`TO_DATE(str,'mask')→STR_TO_DATE`、`LENGTH→CHAR_LENGTH`、`CHR→CHAR`、`SYS_GUID()→UUID()`⚠️、`NVL2(a,b,c)→IF(a IS NOT NULL,b,c)`⚠️、`ADD_MONTHS(d,n)→DATE_ADD(d,INTERVAL n MONTH)`、`MONTHS_BETWEEN(a,b)→TIMESTAMPDIFF(MONTH,b,a)`⚠️参数反转、`ELSIF→ELSEIF`
 - 忠实语义：`a||b→NULLIF(CONCAT(IFNULL(a,''),IFNULL(b,'')),'')`（简单链，NULL 安全）、`DECODE(e,s1,r1,..,def)→CASE WHEN e<=>s1 THEN r1 .. ELSE def END`（`<=>` null-safe）
 - ⚠️ **语义差异 NOTE**（已转但有已知差，转换报告「语义差异 NOTE」段列出，需核对）：`SYS_GUID()→UUID()`（Oracle 32-hex 无连字符 vs MySQL 36 带连字符）、`MONTHS_BETWEEN→TIMESTAMPDIFF`（Oracle 小数月 vs MySQL 整数月截断）、`NVL2→IF`（Oracle `''≡NULL` vs MySQL `''≠NULL`，空串路径分歧）。
-- 结构：EXCEPTION 块→`EXIT HANDLER`（NO_DATA_FOUND→`FOR NOT FOUND`、OTHERS→`FOR SQLEXCEPTION`+`GET DIAGNOSTICS`+`SQLERRM→v_errmsg`）；显式游标 `CURSOR c IS`→`DECLARE c CURSOR FOR`（+done 标志 + `CONTINUE HANDLER FOR NOT FOUND` + label + `EXIT WHEN c%NOTFOUND`→`IF done=1 THEN LEAVE`）；`WHILE..LOOP`→`WHILE..DO`；数值 `FOR v IN lo..hi LOOP`→`WHILE v<=hi DO`（+计数器递增）；`CONTINUE`→`ITERATE label`（FOR 内前置递增防死循环）；`:=`→`SET`/`DEFAULT`；DECLARE 序重排（变量/条件→游标→handler）；头部 `CREATE OR REPLACE`→`DROP IF EXISTS`+`CREATE`、双引号→反引号、去 owner 前缀、`RETURN<type>→RETURNS<type>`；去 Oracle `/` 终止行；`DELIMITER //` 包裹；嵌套 `DECLARE..BEGIN..END`（简单块→MySQL `BEGIN..END`，含 EXCEPTION 的标 TODO）。
+- 结构：EXCEPTION 块→`EXIT HANDLER`（NO_DATA_FOUND→`FOR NOT FOUND`、OTHERS→`FOR SQLEXCEPTION`+`GET DIAGNOSTICS`+`SQLERRM→v_errmsg`）；显式游标 `CURSOR c IS`→`DECLARE c CURSOR FOR`（+done 标志 + `CONTINUE HANDLER FOR NOT FOUND` + label + `EXIT WHEN c%NOTFOUND`→`IF done=1 THEN LEAVE`）；游标 `FOR rec IN c LOOP`→`OPEN c` + `label:LOOP` + `FETCH c INTO rec`（**FETCH INTO 标 TODO：MySQL 无 RECORD 类型，需人工展开为标量变量列表**）+ done check + body + `END LOOP label` + `CLOSE c`（半自动）；`WHILE..LOOP`→`WHILE..DO`；数值 `FOR v IN lo..hi LOOP`→`WHILE v<=hi DO`（+计数器递增）；`CONTINUE`→`ITERATE label`（数值 FOR 内前置递增防死循环；游标 FOR 内直接 ITERATE，FETCH 在循环顶自动推进）；`:=`→`SET`/`DEFAULT`；DECLARE 序重排（变量/条件→游标→handler）；头部 `CREATE OR REPLACE`→`DROP IF EXISTS`+`CREATE`、双引号→反引号、去 owner 前缀、`RETURN<type>→RETURNS<type>`；去 Oracle `/` 终止行；`DELIMITER //` 包裹；嵌套 `DECLARE..BEGIN..END`（简单块→MySQL `BEGIN..END`，含 EXCEPTION 的标 TODO）。
 
-**自动标记 `-- TODO(需人工转换)`**：跨表达式/跨行 `||`（**Route A 下留字面交 PIPES_AS_CONCAT**，TODO 标部署要求——见 Usage Step 5）、`%ROWTYPE`、未解析的 `%TYPE`（无 schema 数据或列未匹配）、`EXECUTE IMMEDIATE`、`BULK COLLECT/FORALL`、`TO_CHAR(number/复杂)`、`DBMS_OUTPUT`、游标/REVERSE `FOR..IN`、`GOTO`（MySQL 不支持）、嵌套 `DECLARE..BEGIN..END`（含 EXCEPTION 的复杂嵌套块）。
+**自动标记 `-- TODO(需人工转换)`**：跨表达式/跨行 `||`（**Route A 下留字面交 PIPES_AS_CONCAT**，TODO 标部署要求——见 Usage Step 5）、`%ROWTYPE`、未解析的 `%TYPE`（无 schema 数据或列未匹配）、`EXECUTE IMMEDIATE`、`BULK COLLECT/FORALL`、`TO_CHAR(number/复杂)`、`DBMS_OUTPUT`、REVERSE `FOR..IN`、内联游标 `FOR rec IN (SELECT..)`、`GOTO`（MySQL 不支持）、嵌套 `DECLARE..BEGIN..END`（含 EXCEPTION 的复杂嵌套块）。
 
 **PACKAGE BODY 拆分**：export 默认导出 PACKAGE BODY（`EXPORT_OBJECT_TYPES` 含 `PACKAGE BODY`），convert 阶段 `_split_package_body` 检测 `CREATE OR REPLACE PACKAGE BODY` → 自动提取内部 PROCEDURE/FUNCTION 为独立 `.sql` 分别转换，PACKAGE 级变量/类型/游标声明不随子程序迁移（需人工，见 FAQ）。PACKAGE spec（仅声明）导出但不自动转换。
 
-**覆盖率**：T1+T2 常见 SP 定义 8/8 全自动转换（corpus 实测 CREATE + golden + 一致性通过）；复杂 T3（`%ROWTYPE` / BULK COLLECT / 动态 SQL / 集合 / 游标 FOR）标 `-- TODO` 走人工（`%TYPE` 已支持自动解析）；PACKAGE BODY 自动拆分+转换。**诚实边界**：纯正则无法区分字符串字面量与代码、无法处理嵌套，强行转换比「提示人工」更坏——不可靠处留 `-- TODO`，均不臆造。转换报告含 **TODO 明细**段（按 `文件:L行号` 定位每条 TODO 原因），便于人工直接跳转处理，无需手动 grep 输出文件。
+**覆盖率**：T1+T2 常见 SP 定义 8/8 全自动转换（corpus 实测 CREATE + golden + 一致性通过）；复杂 T3（`%ROWTYPE` / BULK COLLECT / 动态 SQL / 集合 / 内联游标 FOR）标 `-- TODO` 走人工（`%TYPE` 已支持自动解析；游标 `FOR rec IN cur LOOP` 半自动：OPEN/FETCH/CLOSE 框架自动，FETCH INTO 展开标 TODO）；PACKAGE BODY 自动拆分+转换。**诚实边界**：纯正则无法区分字符串字面量与代码、无法处理嵌套，强行转换比「提示人工」更坏——不可靠处留 `-- TODO`，均不臆造。转换报告含 **TODO 明细**段（按 `文件:L行号` 定位每条 TODO 原因），便于人工直接跳转处理，无需手动 grep 输出文件。
 
 ## 进度
 
@@ -355,7 +355,8 @@ DELIMITER ;
 - [x] 嵌套 DECLARE..BEGIN..END 转换（简单嵌套块→MySQL `BEGIN..END`；含 EXCEPTION 的标 TODO）
 - [x] PACKAGE BODY 拆分（自动提取内部 PROCEDURE/FUNCTION 为独立文件分别转换）
 - [x] `%TYPE` 锚定类型自动解析（`_resolve_anchor_type`：schema 内省 + 离线 fallback）
-- [ ] deferred：T3 族（%ROWTYPE·BULK COLLECT·动态 SQL·集合·游标 FOR 自动转换）、GOTO→unsupported TODO
+- [x] 游标 `FOR rec IN cur LOOP` 半自动转换（OPEN/FETCH/CLOSE 框架；FETCH INTO 展开标 TODO）
+- [ ] deferred：T3 族（%ROWTYPE·BULK COLLECT·动态 SQL·集合·内联游标 FOR 自动转换）、GOTO→unsupported TODO
 
 ## 常见问题（FAQ）
 
@@ -388,6 +389,25 @@ PACKAGE spec（声明部分）目前只导出不自动转换。
 **权限要求**：export 用户需对 `all_tab_columns` 有 SELECT 权限（通常 DBA/迁移账号已具备）。
 
 > `%ROWTYPE`（如 `v_emp emp%ROWTYPE`，多字段 RECORD）不在 `%TYPE` 范围内，需扩为多字段结构，标 TODO 走人工（见 P2）。
+
+### Q: 游标 `FOR rec IN cur LOOP` 转换后，为什么 FETCH INTO 标了 TODO？
+
+MySQL/TiDB **无 RECORD 类型**——Oracle 的 `FETCH cur INTO rec`（`rec` 是整行记录）无法直接对应。转换器会自动生成完整的游标循环框架：
+
+```sql
+OPEN cur;
+lp1: LOOP
+    FETCH cur INTO rec; -- TODO(需人工转换): MySQL 无 RECORD 类型，须展开为标量变量列表（按游标 SELECT 列序）
+    IF done = 1 THEN LEAVE lp1;
+    END IF;
+    -- ...body（CONTINUE 已转 ITERATE）...
+END LOOP lp1;
+CLOSE cur;
+```
+
+`FETCH INTO` 处的 TODO 需人工把 `rec` 展开为按游标 SELECT 列序声明的标量变量列表，如 `FETCH cur INTO v_id, v_name, v_sal;`（变量需在 DECLARE 段先声明）。`OPEN`/`CLOSE`/done handler/`LEAVE`/`ITERATE` 框架均自动生成。
+
+> 内联游标 `FOR rec IN (SELECT..) LOOP`（游标定义内联在 FOR 里，无 `CURSOR..IS` 声明）和 `REVERSE FOR` 仍标 TODO 走人工。
 
 ### Q: macOS 上跑 convert/compare 报「sed 非 GNU 版本」/「awk 非 GNU Awk」？
 
