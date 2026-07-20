@@ -64,7 +64,7 @@ run_convert() {
     [[ "$sg" -gt 0 ]] && sem_line+="SYS_GUID→UUID(Oracle 32-hex 无连字符 vs MySQL 36 带连字符)×${sg}；"
     [[ "$mb" -gt 0 ]] && sem_line+="MONTHS_BETWEEN→TIMESTAMPDIFF(Oracle 小数月 vs MySQL 整数月截断)×${mb}；"
     [[ "$n2" -gt 0 ]] && sem_line+="NVL2→IF(Oracle ''≡NULL vs MySQL ''≠NULL，空串路径分歧)×${n2}；"
-    [[ "$dt" -gt 0 ]] && sem_line+="DATE 类型(Oracle 带时分秒 vs MySQL DATE 仅日期，时间分量被截断——若依赖时间须改 DATETIME)×${dt}；"
+    [[ "$dt" -gt 0 ]] && sem_line+="DATE→DATETIME widening(Oracle DATE 带时分秒→MySQL DATETIME 保时间；若下游期望 DATE 仅日期精度需核对)×${dt}；"
     [[ -n "$sem_line" ]] && sem_section+="  - **$base**：${sem_line}"$'\n'
     log "  $base → $out（TODO: $todos）"
   done
@@ -150,6 +150,8 @@ _apply_mechanical() {
     -e 's/\bNVL\(/IFNULL(/gI' \
     -e 's/\bSYSDATE\b/NOW()/gI' \
     -e 's/\bSYSTIMESTAMP\b/CURRENT_TIMESTAMP(6)/gI' \
+    -e 's/\bDATE\b/DATETIME/gI' \
+    -e 's/\bDATETIME[ \t]*'\''/DATE '\''/gI' \
     -e 's/\bLENGTH[ \t]*\(/CHAR_LENGTH(/gI' \
     -e 's/\bCHR[ \t]*\(/CHAR(/gI' \
     -e 's/\bSYS_GUID[ \t]*\(\)/UUID()/gI' \
