@@ -26,3 +26,6 @@ REPORT_DIR=reports
 CASES_DIR=
 PERF_WARMUP=3
 PERF_REPEAT=10
+# compare 前两端重置的序列（逗号分隔）——harness-owned 确定性：两端 DROP/CREATE SEQUENCE 同起点，
+# 覆盖 NEXTVAL 类非确定值（@架构师 原则：确定性是 harness 属性，非 per-user 手动步骤）。
+COMPARE_RESET_SEQUENCES=

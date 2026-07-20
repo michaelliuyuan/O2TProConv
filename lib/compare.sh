@@ -183,6 +183,18 @@ run_exec() {
   [[ -d "$CASES_DIR" ]] || die "CASES_DIR 不存在: $CASES_DIR"
   require_cmd sqlplus mysql awk
   resolve_dir REPORT_DIR; mkdir -p "$REPORT_DIR"
+  # pre-compare 序列重置（harness-owned 确定性，@架构师 原则）：COMPARE_RESET_SEQUENCES=seq1,seq2
+  # 两端 DROP/CREATE SEQUENCE 同起点，覆盖 NEXTVAL 非确定值。DDL 用通用 START 1 INCREMENT 1，
+  # 具体序列若需自定义 start/increment/NOORDER 等，gate 时按需调。
+  if [[ -n "${COMPARE_RESET_SEQUENCES:-}" ]]; then
+    local IFS=',' seq
+    log "pre-compare 重置序列：$COMPARE_RESET_SEQUENCES"
+    for seq in $COMPARE_RESET_SEQUENCES; do
+      [[ -z "$seq" ]] && continue
+      printf 'DROP SEQUENCE IF EXISTS %s;\nCREATE SEQUENCE %s START WITH 1 INCREMENT BY 1;\n' "$seq" "$seq" | mysql_tidb 2>/dev/null || true
+      printf 'DROP SEQUENCE %s;\nCREATE SEQUENCE %s START WITH 1 INCREMENT BY 1;\nEXIT;\n' "$seq" "$seq" | sqlplus -S "$(oracle_connect)" 2>/dev/null || true
+    done
+  fi
   local report="$REPORT_DIR/compare_report.md"
   { echo "# 一致性对比报告（M3 Cut 1）"; echo; echo "- Oracle: ${ORACLE_USER}@${ORACLE_HOST}"; echo "- TiDB: ${TIDB_USER}@${TIDB_HOST}"; echo "- 用例: $CASES_DIR"; echo; echo "| 用例 | SP | capture | 结果 |"; echo "|------|----|---------|------|"; } >"$report"
   shopt -s nullglob
