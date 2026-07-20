@@ -353,7 +353,8 @@ _rewrite_header() {
     }
     # FUNCTION 头部 RETURN<type> 子句 → RETURNS<type>。多行头也能命中：RETURN-type 子句以 IS/AS 收尾，
     # body 的 RETURN<expr>; 不带 IS/AS 故不误伤（单行/多行 FUNCTION 头通用）。
-    isfunc && $0 ~ /RETURN[ \t]+[A-Za-z0-9_().]+[ \t]+(IS|AS)[ \t]*$/ { sub(/RETURN[ \t]+/, "RETURNS ") }
+    # type 用 [^ \t]+ 匹配：DECIMAL(65,30) 含逗号，[A-Za-z0-9_().] 类不含逗号会漏（fn_square 实测 bug）。
+    isfunc && $0 ~ /RETURN[ \t]+[^ \t]+[ \t]+(IS|AS)[ \t]*$/ { sub(/RETURN[ \t]+/, "RETURNS ") }
     { print }
   '
 }
