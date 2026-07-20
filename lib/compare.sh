@@ -39,9 +39,11 @@ _cmp_parse() {
     /^[ \t]*in[ \t]/  { v=$0; sub(/^[ \t]*in[ \t]+/,"",v);
                        n=split(v,ka,/[ \t]+/); for(i=1;i<=n;i++) if(ka[i]!="") args =(args ==""?"":args ";") "in:" ka[i] }
     /^[ \t]*out[ \t]/ { v=$0; sub(/^[ \t]*out[ \t]+/,"",v);
-                       nm=v; sub(/=.*$/,"",nm);
-                       args =(args ==""?"":args ";") "out:" nm;
-                       outexp=(outexp==""?"":outexp ";") v }
+                       n=split(v,oa,/[ \t]+/); for(i=1;i<=n;i++) if(oa[i]!="") {
+                         ov=oa[i]; on=ov; sub(/=.*$/,"",on);
+                         args =(args ==""?"":args ";") "out:" on;
+                         outexp=(outexp==""?"":outexp ";") ov
+                       } }
     /^[ \t]*norm[ \t]/{ v=$0; sub(/^[ \t]*norm[ \t]+/,"",v); norm=(norm==""?"":norm " ") v }
     /^[ \t]*perf[ \t]/{ v=$0; sub(/^[ \t]*perf[ \t]+/,"",v); perf=(perf==""?"":perf " ") v }
     END { flush() }
