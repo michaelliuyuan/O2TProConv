@@ -36,7 +36,8 @@ _cmp_parse() {
     /^@@case[ \t]/ { flush(); id=kv($0,"id"); sp=kv($0,"sp"); capture=kv($0,"capture"); next }
     /^[ \t]*#/  { next }
     /^[ \t]*$/  { next }
-    /^[ \t]*in[ \t]/  { v=$0; sub(/^[ \t]*in[ \t]+/,"",v);  args =(args ==""?"":args ";")  "in:"  v }
+    /^[ \t]*in[ \t]/  { v=$0; sub(/^[ \t]*in[ \t]+/,"",v);
+                       n=split(v,ka,/[ \t]+/); for(i=1;i<=n;i++) if(ka[i]!="") args =(args ==""?"":args ";") "in:" ka[i] }
     /^[ \t]*out[ \t]/ { v=$0; sub(/^[ \t]*out[ \t]+/,"",v);
                        nm=v; sub(/=.*$/,"",nm);
                        args =(args ==""?"":args ";") "out:" nm;
@@ -102,49 +103,73 @@ _cmp_diff() {
   [[ "$(_cmp_norm "$expected" "$opts")" == "$(_cmp_norm "$actual" "$opts")" ]] && return 0 || return 1
 }
 
-# 生成 TiDB CALL（@vars + SELECT），返回完整 mysql 脚本（输入 stdin 无关，靠参数）
-# $1=sp $2=capture $3=args(ordered) → stdout = mysql SQL（末尾 SELECT 抓 OUT/return）
+# IN 值按类型决定引号：NULL/数字裸传；串/日期加 '...'（启发式：数字外观的串如邮编 '12345' 会误判，
+# Cut 1 实用；后续可让 .cases 显式 in:num/in:str）。@架构师 seq16 确认。
+_cmp_quote_val() {
+  local v="$1"
+  [[ "$v" == "NULL" ]] && { printf 'NULL'; return; }
+  if [[ "$v" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then printf '%s' "$v"; return; fi
+  [[ "$v" == \'* ]] && { printf '%s' "$v"; return; }
+  printf "'%s'" "$v"
+}
+
+# 生成 TiDB CALL。$1=sp $2=capture $3=args(ordered in/out 形参序)。capture-aware：function/inout/out_param。
 _cmp_gen_tidb() {
   local sp="$1" capture="$2" args="$3"
-  local sets="" sels="" IFS=';' kv tag name val
-  local -a callargs=()
+  local IFS=';' kv tag rest name val
+  local -a callargs=(); local sets="" sels=""
   if [[ "$capture" == "function" ]]; then
-    for kv in $args; do tag="${kv%%:*}"; val="${kv#*:}"; [[ "$tag" == "in" ]] && callargs+=( "${val#*=}" ); done
+    for kv in $args; do tag="${kv%%:*}"; rest="${kv#*:}"; [[ "$tag" == "in" ]] && callargs+=( "$(_cmp_quote_val "${rest#*=}")" ); done
     printf 'SELECT %s(%s);\n' "$sp" "$(IFS=','; printf '%s' "${callargs[*]}")"
     return
   fi
-  # procedure: out_param/inout/result_set → @vars
+  if [[ "$capture" == "inout" ]]; then   # INOUT 参全 @var（SET @name=val; CALL(@name)），in: 给初值
+    for kv in $args; do
+      tag="${kv%%:*}"; rest="${kv#*:}"; [[ "$tag" != "in" ]] && continue
+      name="${rest%%=*}"; val="${rest#*=}"
+      sets+="SET @$name=$(_cmp_quote_val "$val");"; callargs+=( "@$name" ); sels+="@$name,"
+    done
+    printf '%sCALL %s(%s);\n' "$sets" "$sp" "$(IFS=','; printf '%s' "${callargs[*]}")"
+    [[ -n "$sels" ]] && printf 'SELECT %s;\n' "${sels%,}"
+    return
+  fi
+  # out_param / result_set：in→引号值，out→@var
   for kv in $args; do
-    tag="${kv%%:*}"; name="${kv#*:}"
-    if [[ "$tag" == "in" ]]; then
-      val="${name#*=}"; callargs+=( "$val" )
-    else  # out
-      sets+="SET @$name=NULL;"; callargs+=( "@$name" ); sels+="@$name,"
-    fi
+    tag="${kv%%:*}"; rest="${kv#*:}"
+    if [[ "$tag" == "in" ]]; then callargs+=( "$(_cmp_quote_val "${rest#*=}")" )
+    else name="$rest"; sets+="SET @$name=NULL;"; callargs+=( "@$name" ); sels+="@$name,"; fi
   done
   printf '%sCALL %s(%s);\n' "$sets" "$sp" "$(IFS=','; printf '%s' "${callargs[*]}")"
   [[ -n "$sels" ]] && printf 'SELECT %s;\n' "${sels%,}"
 }
 
-# 生成 Oracle 调用脚本（sqlplus，VAR ...; EXEC sp(...,:out); PRINT out;）
+# 生成 Oracle 调用（sqlplus）：function→SELECT FROM dual；inout→VAR+:name:=val+EXEC(:name)+PRINT；out_param→VAR+EXEC(:out)+PRINT
 _cmp_gen_oracle() {
   local sp="$1" capture="$2" args="$3"
-  local vars="" prints="" IFS=';' kv tag name val
-  local -a callargs=()
+  local IFS=';' kv tag rest name val
+  local -a callargs=(); local vars="" prints=""
   if [[ "$capture" == "function" ]]; then
-    for kv in $args; do tag="${kv%%:*}"; val="${kv#*:}"; [[ "$tag" == "in" ]] && callargs+=( "${val#*=}" ); done
-    printf 'SELECT %s(%s) FROM dual;\n' "$sp" "$(IFS=','; printf '%s' "${callargs[*]}")"
-    printf 'EXIT;\n'; return
+    for kv in $args; do tag="${kv%%:*}"; rest="${kv#*:}"; [[ "$tag" == "in" ]] && callargs+=( "$(_cmp_quote_val "${rest#*=}")" ); done
+    printf 'SELECT %s(%s) FROM dual;\nEXIT;\n' "$sp" "$(IFS=','; printf '%s' "${callargs[*]}")"
+    return
   fi
+  if [[ "$capture" == "inout" ]]; then
+    for kv in $args; do
+      tag="${kv%%:*}"; rest="${kv#*:}"; [[ "$tag" != "in" ]] && continue
+      name="${rest%%=*}"; val="${rest#*=}"
+      vars+="VAR $name VARCHAR2(4000);\nEXEC :$name:=$(_cmp_quote_val "$val");\n"
+      callargs+=( ":$name" ); prints+="PRINT $name;\n"
+    done
+    printf '%b' "$vars"; printf 'EXEC %s(%s);\n' "$sp" "$(IFS=','; printf '%s' "${callargs[*]}")"; printf '%b' "$prints"; printf 'EXIT;\n'
+    return
+  fi
+  # out_param / result_set
   for kv in $args; do
-    tag="${kv%%:*}"; name="${kv#*:}"
-    if [[ "$tag" == "in" ]]; then callargs+=( "${name#*=}" )
-    else vars+="VAR $name VARCHAR2(4000);\n"; callargs+=( ":$name" ); prints+="PRINT $name;\n"; fi
+    tag="${kv%%:*}"; rest="${kv#*:}"
+    if [[ "$tag" == "in" ]]; then callargs+=( "$(_cmp_quote_val "${rest#*=}")" )
+    else name="$rest"; vars+="VAR $name VARCHAR2(4000);\n"; callargs+=( ":$name" ); prints+="PRINT $name;\n"; fi
   done
-  printf '%b' "$vars"
-  printf 'EXEC %s(%s);\n' "$sp" "$(IFS=','; printf '%s' "${callargs[*]}")"
-  printf '%b' "$prints"
-  printf 'EXIT;\n'
+  printf '%b' "$vars"; printf 'EXEC %s(%s);\n' "$sp" "$(IFS=','; printf '%s' "${callargs[*]}")"; printf '%b' "$prints"; printf 'EXIT;\n'
 }
 
 # 抓 TiDB SELECT 输出里的值（按列序，tab/换行分隔）→ 与 outexp 顺序对齐
