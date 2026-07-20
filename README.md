@@ -60,11 +60,21 @@ cp ora2tidb.conf.example ora2tidb.conf
 
 ```bash
 ./bin/ora2tidb capability -c ora2tidb.conf
-# 6 探针逐个 CREATE+CALL，出 reports/capability_report.md 矩阵：
-#   01_basic_io / 02_declare_order / 03_dynamic_sql / 04_stored_function
-#   05_builtin_compat / 06_bare_assign
-# 全 ✅ 才进下一步（02 实证 MySQL/TiDB DECLARE 强制序：变量/条件 → 游标 → handler）。
 ```
+
+6 探针逐个 CREATE+CALL，出 `reports/capability_report.md` 矩阵。实测输出（TiDB v7.1.9）：
+
+```
+01_basic_io        ✅ 通过
+02_declare_order   ✅ 通过
+03_dynamic_sql     ✅ 通过
+04_stored_function ✅ 通过
+05_builtin_compat  ✅ 通过
+06_bare_assign     ❌ 失败  ERROR 1064 ... near ":= 10"
+[INFO] 能力探针完成：通过 5 / 失败 1
+```
+
+> 06 失败是**预期**——TiDB 不支持裸 `:=` 赋值，坐实转换器 `:=`→`SET` 必要性。02 实证 MySQL/TiDB DECLARE 强制序（变量/条件 → 游标 → handler）。`GET DIAGNOSTICS`（OTHERS handler 用）未在矩阵内，已单测确认支持。
 
 ### 3. 导出 Oracle SP（export）
 
@@ -117,13 +127,31 @@ SOURCE converted/sp_format_report.tidb.sql;
 
 ### 6. 对比（compare）—— 一致性 + 性能
 
-```bash
-# 离线校验用例格式（不需 DB）
-./bin/ora2tidb compare --validate-cases ../ora2tidb-sp-tests/cases
+离线校验用例格式（不需 DB）：
 
-# 执行对比（需两端连接）：两端跑用例 → 归一化 → diff + p50/p99 加速比
-./bin/ora2tidb compare -c ora2tidb.conf
+```bash
+./bin/ora2tidb compare --validate-cases ../ora2tidb-sp-tests/cases
 ```
+
+实测输出：
+
+```
+== 覆盖一致性（test-cases.md ↔ *.cases）==
+  [用例组] 规格有/用例无（漏跑风险）：✅ 无
+  [SP]    用例有/规格无（未评审风险）：fn_decode_null / fn_null_concat / sp_continue_demo / sp_numeric_for
+  TC-T1-01×3  02×2  03×3  04×2  08×4  11×2  |  TC-T2-05×2  06×3  07×4  09×4  10×4
+[INFO] 用例校验完成（格式 + 覆盖）
+```
+
+> 「用例有/规格无」= 某个 SP 加了 `.cases` 但没同步进 `test-cases.md` 规格表——补齐 spec 即全绿。
+
+执行对比（需两端连接，M3）：
+
+```bash
+./bin/ora2tidb compare -c ora2tidb.conf   # 两端跑用例 → 归一化 → diff + p50/p99 加速比
+```
+
+> M3 手动实跑真值（README 作预期产出示例）：**T1+T2 一致性 24/24 全绿（Route A）**；perf 见 `results/perf-oracle-vs-tidb.md`（信息性：Oracle PL/SQL 原生循环调用 ≈0 vs TiDB CALL ~3.5ms 固有调度底，SP-heavy OLTP 迁移需评估）。
 
 ### 一键全流程
 
