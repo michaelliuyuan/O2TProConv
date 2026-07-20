@@ -498,8 +498,9 @@ _convert_type_aware() {
         if(epos==0){ note=note "SUBSTR 跨行需人工; "; out=out line; return out }
         mid=substr(line,cpos+1,epos-cpos-1); n=split_topcomma(mid,A); rep=substr(line,pos,epos-pos+1)
         if (n>=2) {
-          if (A[2]=="0") { sub(/SUBSTR/, "SUBSTRING", rep); gsub(/, 0,/, ", 1,", rep); gsub(/,0,/, ",1,", rep) }
+          if (A[2]=="0") rep="SUBSTRING(" A[1] ", 1" (n>=3 ? ", " A[3] : "") ")"   # start=0→1，2/3 参通用（gsub 只匹 3 参会漏 2 参 SUBSTR(s,0)→SUBSTRING(s,0)='' silent）
           else if (A[2] !~ /^[0-9]+$/) { note=note "SUBSTR start 非字面量(" A[2] ") 可能 0 偏移需人工; "; rep="NULL" }
+          # start>=1 字面量：原 SUBSTR 在 MySQL 合法（SUBSTRING 别名），不变
         }
         out=out substr(line,1,pos-1) rep; line=substr(line,epos+1)
       }
