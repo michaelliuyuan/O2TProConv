@@ -109,6 +109,7 @@ convert_one() {
   text="$(_rewrite_header <<<"$text")"
   text="$(_param_mode     <<<"$text")"
   text="$(_restructure    <<<"$text")"
+  text="$(_convert_type_aware <<<"$text")"
   {
     echo "-- 由 oracle2tidb-sp 自动转换生成；请核对带 -- TODO(需人工转换) 的行"
     # _rewrite_header 注入的真实 DROP 可能位于首部注释之后（源文件带头部注释）。
@@ -386,6 +387,166 @@ _fix_header() {
   }'
 }
 
+# Phase 1 类型推断 pass（架构师 spec：本地 symtab + infer_type，解锁 TRUNC/INSTR/TO_NUMBER/TO_CHAR(num)/
+# SUBSTR(0-offset)/NEXTVAL）。置 _restructure 后：此时声明已 MySQL `DECLARE v TYPE;`、body 已 MySQL 形态。
+# 两遍 awk：① 扫 DECLARE 行 + CREATE 头参数建 symtab {var→typeclass}；② 按规则转 body，不确定→注 `-- TODO(需人工)`（非静默）。
+# typeclass：number/date/string/bool；schema 列/复杂/未声明=unknown→NOTE（Phase 3 schema 内省后才解列）。
+# 边界（架构师）：TRUNC(num,digits)→TRUNCATE(num,digits) 透传 digits；INSTR 负 start（反向搜索）→NOTE 不透传 LOCATE。
+# date-arith（date1-date2/date+n）无关键字、需表达式解析，本批 defer。
+_convert_type_aware() {
+  awk '
+    BEGIN { q = sprintf("%c", 39); inhdr=0; hdrdepth=0 }
+    function trim(s){ sub(/^[ \t]+/,"",s); sub(/[ \t]+$/,"",s); return s }
+    function typeclass(t,   tl){ tl=toupper(t); sub(/\(.*$/,"",tl)
+      if (tl ~ /^(DECIMAL|NUMERIC|INT|INTEGER|BIGINT|SMALLINT|TINYINT|MEDIUMINT|FLOAT|DOUBLE|PLS_INTEGER|BINARY_INTEGER|SIMPLE_INTEGER)$/) return "number"
+      if (tl ~ /^(DATE|DATETIME|TIMESTAMP|TIME)$/) return "date"
+      if (tl ~ /^(VARCHAR|CHAR|TEXT|CLOB|NVARCHAR|NCHAR|BLOB|BINARY|VARBINARY)$/) return "string"
+      if (tl ~ /^(BOOL|BOOLEAN)$/) return "bool"
+      return "" }
+    function match_paren(s,op,   n,i,depth,c){ n=length(s); depth=0
+      for(i=op;i<=n;i++){ c=substr(s,i,1); if(c=="(")depth++; else if(c==")"){depth--; if(depth==0)return i} }
+      return 0 }
+    function split_topcomma(s,A,   n,i,c,depth,cur,cnt){ n=length(s);depth=0;cur="";cnt=0
+      for(i=1;i<=n;i++){ c=substr(s,i,1)
+        if(c=="(")depth++; else if(c==")")depth--
+        else if(c==","&&depth==0){cnt++;A[cnt]=trim(cur);cur="";continue}
+        cur=cur c }
+      cnt++; A[cnt]=trim(cur); return cnt }
+    function infer_type(e,   ee,h){
+      ee=trim(e); if(ee=="") return "unknown"
+      if (ee in type) return type[ee]
+      if (ee=="NULL") return "unknown"
+      if (substr(ee,1,1)==q) return "string"
+      if (ee ~ /^[-+]?[0-9]+(\.[0-9]+)?$/) return "number"
+      h=toupper(ee)
+      if (h ~ /^(SYSDATE|NOW\(\)|CURRENT_TIMESTAMP(\([0-9]*\))?|CURRENT_DATE(\(\))?|SYSTIMESTAMP)$/) return "date"
+      if (h ~ /^(TO_DATE|STR_TO_DATE|ADD_MONTHS|DATE_ADD|DATE_SUB|LAST_DAY)\(/) return "date"
+      if (h ~ /^(TO_NUMBER|LENGTH|CHAR_LENGTH|INSTR|LOCATE|MOD|ROUND|TRUNCATE|ABS|CEIL|FLOOR|SIGN|POWER|SQRT|DATEDIFF|TIMESTAMPDIFF)\(/) return "number"
+      if (h ~ /^(SUBSTR|SUBSTRING|CHR|CHAR|CONCAT|REPLACE|UPPER|LOWER|TRIM|LTRIM|RTRIM|LPAD|RPAD|TO_CHAR)\(/) return "string"
+      return "unknown" }
+    function reg_pair(p,   vn,tt){    # 输入含前缀 [(,]/DECLARE + 可选 mode + name + type → type[name]=class
+      sub(/^[(,][ \t]*/,"",p)                                                        # 去前导 (,
+      sub(/^DECLARE[ \t]+/,"",p)                                                     # 去前导 DECLARE
+      sub(/^(IN[ \t]+OUT[ \t]+|INOUT[ \t]+|IN[ \t]+|OUT[ \t]+)/,"",p)                # 去参数 mode
+      vn=p; sub(/[ \t].*$/,"",vn); tt=p; sub(/^[A-Za-z_][A-Za-z0-9_]*[ \t]+/,"",tt); sub(/[ \t].*$/,"",tt)
+      if (typeclass(tt)!="" && !(vn in type)) type[vn]=typeclass(tt) }
+    function conv_trunc(line,   out,pos,prev,cpos,epos,mid,A,n,tc,rep){
+      out=""
+      while(match(line,/TRUNC[ \t]*\(/)){
+        pos=RSTART
+        if(pos>1){ prev=substr(line,pos-1,1); if(prev~/[A-Za-z0-9_]/){ out=out substr(line,1,pos); line=substr(line,pos+1); continue } }
+        cpos=pos+RLENGTH-1; epos=match_paren(line,cpos)
+        if(epos==0){ note=note "TRUNC 跨行需人工; "; out=out line; return out }
+        mid=substr(line,cpos+1,epos-cpos-1); n=split_topcomma(mid,A); rep=substr(line,pos,epos-pos+1)
+        if (n==1) { tc=infer_type(A[1])
+          if (tc=="number")    rep="TRUNCATE(" A[1] ",0)"
+          else if (tc=="date") rep="CAST(" A[1] " AS DATE)"
+          else                 { note=note "TRUNC(" A[1] ") 参数类型不可判需人工; "; rep="NULL" }
+        } else if (n==2) {
+          if (infer_type(A[1])=="number" && infer_type(A[2])=="number") rep="TRUNCATE(" A[1] ", " A[2] ")"
+          else { note=note "TRUNC(" A[1] "," A[2] ") 2 参(date+fmt 或混类型)需人工; "; rep="NULL" }
+        } else { note=note "TRUNC >2 参需人工; "; rep="NULL" }
+        out=out substr(line,1,pos-1) rep; line=substr(line,epos+1)
+      }
+      return out line }
+    function conv_instr(line,   out,pos,prev,cpos,epos,mid,A,n,rep){
+      out=""
+      while(match(line,/INSTR[ \t]*\(/)){
+        pos=RSTART
+        if(pos>1){ prev=substr(line,pos-1,1); if(prev~/[A-Za-z0-9_]/){ out=out substr(line,1,pos); line=substr(line,pos+1); continue } }
+        cpos=pos+RLENGTH-1; epos=match_paren(line,cpos)
+        if(epos==0){ note=note "INSTR 跨行需人工; "; out=out line; return out }
+        mid=substr(line,cpos+1,epos-cpos-1); n=split_topcomma(mid,A); rep=substr(line,pos,epos-pos+1)
+        if (n==2)      rep="LOCATE(" A[2] ", " A[1] ")"                                  # ⚠️前两参互换 INSTR(s,sub)→LOCATE(sub,s)
+        else if (n==3) { if (A[3] ~ /^-/) { note=note "INSTR 负 start(反向搜索) LOCATE 不支持需人工; "; rep="NULL" }
+                         else rep="LOCATE(" A[2] ", " A[1] ", " A[3] ")" }
+        else           { note=note "INSTR 4 参(nth)无直接等价需人工; "; rep="NULL" }
+        out=out substr(line,1,pos-1) rep; line=substr(line,epos+1)
+      }
+      return out line }
+    function conv_to_number(line,   out,pos,prev,cpos,epos,mid,A,n,rep){
+      out=""
+      while(match(line,/TO_NUMBER[ \t]*\(/)){
+        pos=RSTART
+        if(pos>1){ prev=substr(line,pos-1,1); if(prev~/[A-Za-z0-9_]/){ out=out substr(line,1,pos); line=substr(line,pos+1); continue } }
+        cpos=pos+RLENGTH-1; epos=match_paren(line,cpos)
+        if(epos==0){ note=note "TO_NUMBER 跨行需人工; "; out=out line; return out }
+        mid=substr(line,cpos+1,epos-cpos-1); n=split_topcomma(mid,A); rep=substr(line,pos,epos-pos+1)
+        if (n==1) rep="CAST(" A[1] " AS DECIMAL(65,30))"
+        out=out substr(line,1,pos-1) rep; line=substr(line,epos+1)
+      }
+      return out line }
+    function conv_to_char_num(line,   out,pos,prev,cpos,epos,mid,A,n,tc,rep){
+      out=""   # TO_CHAR(number) 单参→CAST AS CHAR；TO_CHAR(date,'mask') 已由 _tochar_date 转 DATE_FORMAT
+      while(match(line,/TO_CHAR[ \t]*\(/)){
+        pos=RSTART
+        if(pos>1){ prev=substr(line,pos-1,1); if(prev~/[A-Za-z0-9_]/){ out=out substr(line,1,pos); line=substr(line,pos+1); continue } }
+        cpos=pos+RLENGTH-1; epos=match_paren(line,cpos)
+        if(epos==0){ note=note "TO_CHAR 跨行需人工; "; out=out line; return out }
+        mid=substr(line,cpos+1,epos-cpos-1); n=split_topcomma(mid,A); rep=substr(line,pos,epos-pos+1)
+        if (n==1) { if (infer_type(A[1])=="number") rep="CAST(" A[1] " AS CHAR)"; else { note=note "TO_CHAR(" A[1] ") 非 number 单参需人工; "; rep="NULL" } }
+        else        { note=note "TO_CHAR(..,..) 多参(number+fmt 或残留 date)需人工; "; rep="NULL" }
+        out=out substr(line,1,pos-1) rep; line=substr(line,epos+1)
+      }
+      return out line }
+    function conv_substr(line,   out,pos,prev,cpos,epos,mid,A,n,rep){
+      out=""   # SUBSTR(s,0,n)→SUBSTRING(s,1,n)；start>=1 字面量 MySQL SUBSTR 兼容不变；start=变量→NOTE
+      while(match(line,/SUBSTR[ \t]*\(/)){
+        pos=RSTART
+        if(pos>1){ prev=substr(line,pos-1,1); if(prev~/[A-Za-z0-9_]/){ out=out substr(line,1,pos); line=substr(line,pos+1); continue } }
+        cpos=pos+RLENGTH-1; epos=match_paren(line,cpos)
+        if(epos==0){ note=note "SUBSTR 跨行需人工; "; out=out line; return out }
+        mid=substr(line,cpos+1,epos-cpos-1); n=split_topcomma(mid,A); rep=substr(line,pos,epos-pos+1)
+        if (n>=2) {
+          if (A[2]=="0") { sub(/SUBSTR/, "SUBSTRING", rep); gsub(/, 0,/, ", 1,", rep); gsub(/,0,/, ",1,", rep) }
+          else if (A[2] !~ /^[0-9]+$/) { note=note "SUBSTR start 非字面量(" A[2] ") 可能 0 偏移需人工; "; rep="NULL" }
+        }
+        out=out substr(line,1,pos-1) rep; line=substr(line,epos+1)
+      }
+      return out line }
+    function conv_nextval(line,   out,pos,m,seq){
+      out=""   # seq.NEXTVAL → NEXTVAL(seq)
+      while(match(line,/[A-Za-z_][A-Za-z0-9_]*\.NEXTVAL/)){
+        pos=RSTART; m=substr(line,RSTART,RLENGTH); seq=m; sub(/\.NEXTVAL$/,"",seq)
+        out=out substr(line,1,pos-1) "NEXTVAL(" seq ")"; line=substr(line,RSTART+RLENGTH)
+      }
+      return out line }
+    function check_date_arith(line,   v,re){   # 粗粒度 date 算术 NOTE（堵 silent 坑，真正转换留 focused 批）
+      for (v in type) { if (type[v]!="date") continue
+        re = "(^|[^A-Za-z0-9_])" v "[ \t]*[-+][ \t]*"                       # <datevar> - / +
+        if (line ~ re) { note=note "疑似 date 算术(" v "[+-]..)——MySQL 不直接支持 date-date/date+n(date 隐式转数字算错)，需 DATEDIFF/DATE_ADD; "; return }
+        re = "[ \t][-+][ \t]*" v "([^A-Za-z0-9_]|$)"                         # ..- / + <datevar>
+        if (line ~ re) { note=note "疑似 date 算术(..[+-]" v ")——MySQL date 算术需 DATEDIFF/DATE_ADD; "; return }
+      }
+    }
+    # pass 1：建 symtab（DECLARE 行 + CREATE 头参数），存全部行
+    {
+      if ($0 ~ /^CREATE[ \t]+(OR[ \t]+REPLACE[ \t]+)?(PROCEDURE|FUNCTION)[ \t]+/) inhdr=1
+      if (inhdr) { s=$0
+        while (match(s, /(IN[ \t]+OUT[ \t]+|INOUT[ \t]+|IN[ \t]+|OUT[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]+[A-Za-z_][A-Za-z0-9_()]*/)) {
+          reg_pair(substr(s,RSTART,RLENGTH)); s=substr(s, RSTART+RLENGTH) }
+        # 头参数列表闭合按括号深度判（CREATE 的 `(` 被归零的 `)` 闭合），非任意 `)`——
+        # 避开 DECIMAL(65,30)/VARCHAR(4000) 类型精度里的 `)` 误判提前关闭。
+        tmp=$0; no=gsub(/\(/,"",tmp); tmp=$0; nc=gsub(/\)/,"",tmp); hdrdepth += no - nc
+        if (hdrdepth <= 0) { inhdr=0; hdrdepth=0 }
+      }
+      if ($0 ~ /^[ \t]*DECLARE[ \t]+[A-Za-z_]/ && $0 !~ /CURSOR|HANDLER|CONDITION/) { s=$0
+        if (match(s, /DECLARE[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+[A-Za-z_][A-Za-z0-9_()]*/)) reg_pair(substr(s,RSTART,RLENGTH)) }
+      lines[NR]=$0
+    }
+    END {   # pass 2：类型感知转换 + NOTE
+      for (i=1; i<=NR; i++) {
+        l=lines[i]; note=""
+        if (l ~ /^[ \t]*--/) { print l; continue }
+        l=conv_trunc(l); l=conv_instr(l); l=conv_to_number(l); l=conv_to_char_num(l); l=conv_substr(l); l=conv_nextval(l)
+        check_date_arith(l)
+        if (note != "") print "-- TODO(需人工): " note
+        print l
+      }
+    }
+  '
+}
+
 # 复杂结构检测：在匹配行上方注入 TODO 注释（保留原行）。
 _mark_complex() {
   awk '
@@ -398,13 +559,10 @@ _mark_complex() {
       if ($0 ~ /%TYPE|%ROWTYPE/)                 todo("锚定类型 %TYPE/%ROWTYPE 需解析为具体类型")
       if ($0 ~ /EXECUTE[ \t]+IMMEDIATE/)         todo("动态 SQL EXECUTE IMMEDIATE 需改 PREPARE/EXECUTE/DEALLOCATE")
       if ($0 ~ /BULK[ \t]+COLLECT|FORALL/)       todo("批量操作 BULK COLLECT/FORALL 无直接对应，需改写为游标循环")
-      if ($0 ~ /(^|[^A-Za-z0-9_])TO_CHAR[ \t]*\(/)  todo("TO_CHAR(number 或复杂参数) 无干净 MySQL 对应，需人工（DATE 形态已自动转 DATE_FORMAT）")
-      if ($0 ~ /(^|[^A-Za-z0-9_])TO_NUMBER[ \t]*\(/) todo("TO_NUMBER 需改 CONVERT(.., type) 或 CAST，需人工指明目标类型")
+      # 注：TRUNC / INSTR / TO_NUMBER / TO_CHAR(number) / SUBSTR(0-offset) / NEXTVAL 现由 _convert_type_aware
+      # （Phase 1 类型推断，置 _restructure 后）按 symtab 自动转换；不确定项在那 pass 内注 TODO。此处不再标，避免残留假阳性。
       if ($0 ~ /(^|[^A-Za-z0-9_])TO_DATE[ \t]*\(/)  todo("TO_DATE(复杂参数/无掩码) 需人工 STR_TO_DATE（简单 TO_DATE(str,'mask') 已自动转 STR_TO_DATE，此处排除 STR_TO_DATE 子串假阳性）")
-      if ($0 ~ /(^|[^A-Za-z0-9_])TRUNC[ \t]*\(/)    todo("TRUNC 歧义：数值→TRUNCATE / 日期→CAST AS DATE 或月初，需按参数类型人工判定")
-      if ($0 ~ /(^|[^A-Za-z0-9_])INSTR[ \t]*\(/)    todo("INSTR 多参数形态需按参数改 INSTR/LOCATE/SUBSTRING_INDEX，无法自动判定")
       if ($0 ~ /LISTAGG/)                        todo("LISTAGG(..) WITHIN GROUP(ORDER BY ..) 需改 GROUP_CONCAT(.. ORDER BY .. SEPARATOR ..)")
-      if ($0 ~ /\.NEXTVAL/)                      todo("sequence.NEXTVAL 需改 NEXTVAL(sequence)（TiDB 序列语法）")
       if ($0 ~ /DBMS_OUTPUT/)                    todo("DBMS_OUTPUT 需改 SELECT 结果 / 写日志表")
       # 注：EXCEPTION 块（WHEN NO_DATA_FOUND/OTHERS）/ 显式游标 CURSOR..IS / 数值 FOR..IN 现由 _restructure
       # 自动转换（EXIT handler / DECLARE..CURSOR FOR + done / WHILE+计数器）；游标/REVERSE FOR 在 _restructure
