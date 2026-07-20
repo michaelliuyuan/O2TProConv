@@ -21,6 +21,12 @@ EXPORT_DIR=exported
 CONVERTED_DIR=converted
 REPORT_DIR=reports
 
+# ===== export 导出对象类型（冒号分隔，因 'PACKAGE BODY' 含空格）=====
+# 留空走默认：PROCEDURE:FUNCTION:PACKAGE BODY:PACKAGE
+# convert.sh 对 PROCEDURE/FUNCTION 直接转换；PACKAGE BODY 经 _split_package_body
+# 拆分为独立子程序；PACKAGE spec（仅声明）只导出不自动转换。
+EXPORT_OBJECT_TYPES=
+
 # ===== compare 参数（M3）=====
 # 用例目录（测试语料库 cases/*.cases），warm-up 后重复 N 次取 avg/p50/p99
 CASES_DIR=
