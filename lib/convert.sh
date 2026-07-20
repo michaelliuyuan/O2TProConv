@@ -855,6 +855,8 @@ _param_mode() {
     /^create[ \t]+(or[ \t]+replace[ \t]+)?procedure[ \t]+/ { isfunc=0; active=1 }
     {
       s=$0; no=gsub(/\(/,"",s); s=$0; nc=gsub(/\)/,"",s)
+      # 先判断本行是否含 AS/IS（参数区结束标志），但参数重写仍需在本行执行
+      line_has_as = ($0 ~ /[ \t](AS|IS)[ \t]*$/ || $0 ~ /^[ \t]*(AS|IS)[ \t]*$/)
       if (active && !closed && !isfunc) {
         $0 = gensub(/([(, \t])([A-Za-z_][A-Za-z0-9_]*)[ \t]+(IN[ \t]+OUT|INOUT|IN|OUT)[ \t]+/, "\\1\\3 \\2 ", "g")
         gsub(/IN[ \t]+OUT/, "INOUT")
@@ -864,7 +866,11 @@ _param_mode() {
         $0 = gensub(/([A-Za-z_][A-Za-z0-9_]*)[ \t]+(IN[ \t]+OUT|INOUT|IN|OUT)[ \t]+/, "\\1 ", "g")
       }
       depth += (no - nc)
-      if (active && !closed && depth<=0 && (no>0||nc>0)) closed=1
+      # 参数区关闭条件（优先级）：① 本行含 AS/IS（无参或 AS 结尾） ② 括号 depth 回 0（有参 SP）
+      if (active && !closed) {
+        if (line_has_as) closed=1
+        else if (depth<=0 && (no>0||nc>0)) closed=1
+      }
       print
     }
   '
