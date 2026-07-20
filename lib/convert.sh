@@ -215,12 +215,14 @@ _convert_known_semantics() {
         rs=RSTART; rl=RLENGTH                         # match(m,...) 下面会覆盖全局 RSTART/RLENGTH，先存
         m=substr(line,rs,rl)
         rest=substr(line,rs+rl)
-        if(rest !~ /^[ \t]*([;),]|$)/){ out=out substr(line,1,rs); line=substr(line,rs+1); continue }
+        # rest 须以 ;/) /, 终结（非裸 EOL）：裸 EOL = 多行 || 链续行（如 sp_format_report
+        # SELECT 'DEPT='||v_dname 续到下行），不在此部分转——Route A 下整链留字面交 PIPES_AS_CONCAT。
+        if(rest !~ /^[ \t]*[;),]/){ out=out substr(line,1,rs); line=substr(line,rs+1); continue }
         if(match(m,/^(:=|[(),]|(RETURN|SELECT|VALUES|WHERE|THEN|ELSE|WHEN)[ \t]+)[ \t]*/)){ pre=substr(m,1,RLENGTH); chain=substr(m,RLENGTH+1) } else { pre=""; chain=m }
         n=split_pipes(chain,A)
         unsafe=0
         for(i=1;i<=n;i++){ ss=strip_str(A[i]); if(ss ~ /[+\-*/=<>]/ || ss ~ /(^|[^A-Za-z0-9_])(AND|OR|NOT|FROM|WHERE|SELECT|INTO|VALUES|THEN|ELSE|WHEN|CASE|END)([^A-Za-z0-9_]|$)/){ unsafe=1; break } }
-        if(unsafe){ todo=todo "|| 拼接含混运算符/关键字，操作数边界不可靠，需人工 CONCAT; "; out=out substr(line,1,rs+rl-1); line=rest; continue }
+        if(unsafe){ todo=todo "|| 操作数边界不可靠，保留字面；目标库须 sql_mode 含 PIPES_AS_CONCAT 且 SP 须此模式下 CREATE（创建时锁定），否则 ||=OR; "; out=out substr(line,1,rs+rl-1); line=rest; continue }
         inner=""
         for(i=1;i<=n;i++){ inner=(i==1?"":inner ", ") "IFNULL(" trim(A[i]) "," q q ")" }
         cs="NULLIF(CONCAT(" inner ")," q q ")"
@@ -261,7 +263,7 @@ _convert_known_semantics() {
       todo=""
       line=conv_decode(line)
       line=conv_concat(line)
-      if(code_has_pipe(line))   todo=todo "|| 拼接未能自动转换（SELECT 列表/跨行表达式边界不可靠）需人工 CONCAT；⚠️MySQL 默认 || = OR，残留即语义错（CREATE 能过但算错）! "
+      if(code_has_pipe(line))   todo=todo "|| 保留字面（SELECT 列表/跨行表达式边界不可靠，未自动转）；目标库须 sql_mode 含 PIPES_AS_CONCAT 且 SP 须此模式下 CREATE（创建时锁定），否则 ||=OR 算错；含 NULL 操作数时改 CONCAT(IFNULL)（简单 || 已自动转）; "
       if(code_has_decode(line)) todo=todo "DECODE 未能自动转换（跨行/畸形），需人工 CASE; "
       if(todo != "") print "-- TODO(需人工转换): " todo
       print line
