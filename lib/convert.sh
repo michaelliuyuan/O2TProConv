@@ -15,7 +15,8 @@ set -euo pipefail
 _collect_todos() {
   local out_file="$1" base="$2"
   local todo_lines
-  todo_lines="$(grep -nE '^--[[:space:]]*TODO\(' "$out_file" 2>/dev/null || true)"
+  # 匹配行首或缩进后的 -- TODO(...)（_restructure 的 TODO 可能带缩进）
+  todo_lines="$(grep -nE '^[[:space:]]*--[[:space:]]*TODO\(' "$out_file" 2>/dev/null || true)"
   [[ -z "$todo_lines" ]] && return 0
   local lineno reason
   while IFS= read -r line; do
@@ -494,6 +495,52 @@ _convert_known_semantics() {
       }
       return out line
     }
+    # LISTAGG(expr, sep) WITHIN GROUP (ORDER BY ...) → GROUP_CONCAT(expr ORDER BY ... SEPARATOR sep)
+    # 单行匹配。OVER (PARTITION BY...) 分析函数形式标 TODO（MySQL GROUP_CONCAT 无分析函数支持）。
+    function conv_listagg(line,   out,pos,prev,cpos,epos,mid,A,n,wg_start,wg_end,wg_inner,
+                          ob_start,ob_end,orderby,expr,sep,repl,rest,over_idx){
+      out=""
+      while(match(line,/LISTAGG[ \t]*\(/)){
+        pos=RSTART
+        if(pos>1){ prev=substr(line,pos-1,1); if(prev~/[A-Za-z0-9_]/){ out=out substr(line,1,pos); line=substr(line,pos+1); continue } }
+        cpos=pos+RLENGTH-1; epos=match_paren(line,cpos)
+        if(epos==0){ todo=todo "LISTAGG 跨行需人工 GROUP_CONCAT; "; out=out line; return out }
+        mid=substr(line,cpos+1,epos-cpos-1); n=split_topcomma(mid,A)
+        if(n<1 || n>2){ out=out substr(line,1,epos); line=substr(line,epos+1); continue }
+        expr=trim(A[1])
+        sep=(n==2 ? trim(A[2]) : q q)
+        rest=substr(line,epos+1)
+        # 必须跟 WITHIN GROUP (ORDER BY ...)
+        if(match(rest,/^[ \t]*WITHIN[ \t]+GROUP[ \t]*\(/)){
+          wg_start=RSTART
+          wg_inner_start=epos+wg_start+RLENGTH-1   # 指向 ORDER BY 的 (
+          wg_end=match_paren(rest, wg_start+RLENGTH-1)
+          if(wg_end==0){ todo=todo "LISTAGG WITHIN GROUP 括号不配对需人工; "; out=out substr(line,1,epos); line=rest; continue }
+          wg_inner=substr(rest, wg_start+RLENGTH, wg_end-wg_start-RLENGTH)
+          # wg_inner 应为 "ORDER BY sortcol [DESC|ASC]"（大小写不敏感）
+          if(match(toupper(wg_inner),/^[ \t]*ORDER[ \t]+BY[ \t]+/)){
+            orderby=substr(wg_inner,RLENGTH+1)
+            gsub(/^[ \t]+|[ \t]+$/,"",orderby)
+          } else {
+            orderby=wg_inner   # 非 ORDER BY 开头，原样保留
+          }
+          # 检查 OVER (PARTITION BY ...) 分析函数形式
+          over_rest=substr(rest, wg_end+1)
+          if(match(over_rest,/^[ \t]*OVER[ \t]*\(/)){
+            todo=todo "LISTAGG OVER(PARTITION BY) 分析函数 MySQL GROUP_CONCAT 不支持，需人工; "
+            out=out substr(line,1,epos); line=rest; continue
+          }
+          # 生成 GROUP_CONCAT(expr ORDER BY orderby SEPARATOR sep)
+          repl="GROUP_CONCAT(" expr " ORDER BY " orderby " SEPARATOR " sep ")"
+          out=out substr(line,1,pos-1) repl
+          line=substr(rest, wg_end+1)
+        } else {
+          # LISTAGG 不带 WITHIN GROUP → 不处理（非标准/跨行），留 _mark_complex TODO
+          out=out substr(line,1,epos); line=rest; continue
+        }
+      }
+      return out line
+    }
     function code_has_pipe(s,   n,i,c,depth,in_str,nx){
       n=length(s); depth=0; in_str=0
       for(i=1;i<=n;i++){
@@ -529,6 +576,7 @@ _convert_known_semantics() {
       line=conv_nvl2(line)
       line=conv_add_months(line)
       line=conv_months_between(line)
+      line=conv_listagg(line)
       if(code_has_pipe(line))   todo=todo "|| 保留字面（SELECT 列表/跨行表达式边界不可靠，未自动转）；目标库须 sql_mode 含 PIPES_AS_CONCAT 且 SP 须此模式下 CREATE（创建时锁定），否则 ||=OR 算错；含 NULL 操作数时改 CONCAT(IFNULL)（简单 || 已自动转）; "
       if(code_has_decode(line)) todo=todo "DECODE 未能自动转换（跨行/畸形），需人工 CASE; "
       if(todo != "") print "-- TODO(需人工转换): " todo
@@ -756,7 +804,7 @@ _mark_complex() {
       # 注：TRUNC / INSTR / TO_NUMBER / TO_CHAR(number) / SUBSTR(0-offset) / NEXTVAL 现由 _convert_type_aware
       # （Phase 1 类型推断，置 _restructure 后）按 symtab 自动转换；不确定项在那 pass 内注 TODO。此处不再标，避免残留假阳性。
       if ($0 ~ /(^|[^A-Za-z0-9_])TO_DATE[ \t]*\(/)  todo("TO_DATE(复杂参数/无掩码) 需人工 STR_TO_DATE（简单 TO_DATE(str,'mask') 已自动转 STR_TO_DATE，此处排除 STR_TO_DATE 子串假阳性）")
-      if ($0 ~ /LISTAGG/)                        todo("LISTAGG(..) WITHIN GROUP(ORDER BY ..) 需改 GROUP_CONCAT(.. ORDER BY .. SEPARATOR ..)")
+      # 注：LISTAGG WITHIN GROUP(ORDER BY) 现由 _convert_known_semantics 自动转 GROUP_CONCAT（OVER 分析函数形式标 TODO）
       if ($0 ~ /DBMS_OUTPUT/)                    todo("DBMS_OUTPUT 需改 SELECT 结果 / 写日志表")
       if ($0 ~ /(^|[^A-Za-z0-9_])GOTO[ \t]+[A-Za-z_]/) todo("GOTO 语句 MySQL 不支持，需改写为 IF/LOOP/LEAVE 控制流")
       if ($0 ~ /<<[A-Za-z_][A-Za-z0-9_]*>>/) todo("GOTO 标签 <<label>> MySQL 不支持，需配合 GOTO 改写移除")
@@ -1137,10 +1185,10 @@ _restructure() {
         bodybuf=bodybuf ind "SET @sql = " sql_expr ";\n"
         bodybuf=bodybuf ind "PREPARE stmt FROM @sql;\n"
         if (has_into) {
-          bodybuf=bodybuf ind "EXECUTE stmt" exec_suffix "; -- TODO(需人工转换): Oracle INTO " into_vars " MySQL PREPARE 无单行 SELECT 返回对应，需改 DECLARE+OPEN/FETCH 游标\n"
-        } else {
-          bodybuf=bodybuf ind "EXECUTE stmt" exec_suffix ";\n"
+          # INTO TODO 独立行（须行首 -- TODO 格式，_collect_todos 才能收集进报告）
+          bodybuf=bodybuf ind "-- TODO(需人工转换): EXECUTE IMMEDIATE INTO " into_vars " MySQL PREPARE 无单行 SELECT 返回对应，需改 DECLARE+OPEN/FETCH 游标\n"
         }
+        bodybuf=bodybuf ind "EXECUTE stmt" exec_suffix ";\n"
         bodybuf=bodybuf ind "DEALLOCATE PREPARE stmt;\n"; next
       }
       l=conv_assign(line); bodybuf=bodybuf l "\n"
