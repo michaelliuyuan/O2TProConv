@@ -758,9 +758,9 @@ _mark_complex() {
       if ($0 ~ /DBMS_OUTPUT/)                    todo("DBMS_OUTPUT 需改 SELECT 结果 / 写日志表")
       if ($0 ~ /(^|[^A-Za-z0-9_])GOTO[ \t]+[A-Za-z_]/) todo("GOTO 语句 MySQL 不支持，需改写为 IF/LOOP/LEAVE 控制流")
       if ($0 ~ /<<[A-Za-z_][A-Za-z0-9_]*>>/) todo("GOTO 标签 <<label>> MySQL 不支持，需配合 GOTO 改写移除")
-      # 注：EXCEPTION 块（WHEN NO_DATA_FOUND/OTHERS）/ 显式游标 CURSOR..IS / 数值 FOR..IN 现由 _restructure
-      # 自动转换（EXIT handler / DECLARE..CURSOR FOR + done / WHILE+计数器）；游标/REVERSE FOR 在 _restructure
-      # 内单独标 TODO。此处不再标 FOR/EXCEPTION/CURSOR，避免残留假阳性。
+      # 注：EXCEPTION 块（WHEN NO_DATA_FOUND/OTHERS）/ 显式游标 CURSOR..IS / 数值 FOR..IN / 游标 FOR rec IN cur LOOP
+      # 现由 _restructure 自动转换（EXIT handler / DECLARE..CURSOR FOR + done / WHILE+计数器 / OPEN+FETCH+CLOSE）；
+      # REVERSE FOR 在 _restructure 内单独标 TODO。此处不再标 FOR/EXCEPTION/CURSOR，避免残留假阳性。
       print
     }
   '
@@ -1009,10 +1009,11 @@ _restructure() {
         if (block_depth > 0) { bodybuf=bodybuf "-- TODO(需人工转换): 嵌套 EXCEPTION 块\n"; next }
         state="exception"; exc_curr=""; next
       }
-      if (line ~ /^[ \t]*END[ \t]+LOOP/) {                                     # END LOOP：FOR→SET 计数器+1 + END WHILE label；WHILE→END WHILE；LOOP→保留
+      if (line ~ /^[ \t]*END[ \t]+LOOP/) {                                     # END LOOP：FOR→SET 计数器+1 + END WHILE；CFOR→END LOOP + CLOSE；WHILE→END WHILE；LOOP→保留
         ind=getindent(line)
         if (ltop>0) {
           if (ltype[ltop]=="FOR")      bodybuf=bodybuf ind "    SET " lvar[ltop] " = " lvar[ltop] " + 1;\n" ind "END WHILE " llabel[ltop] ";\n"
+          else if (ltype[ltop]=="CFOR") bodybuf=bodybuf ind "END LOOP " llabel[ltop] ";\n" ind "CLOSE " lcursor[ltop] ";\n"
           else if (ltype[ltop]=="WHILE") { l=line; sub(/LOOP/, "WHILE", l); bodybuf=bodybuf l "\n" }
           else                          bodybuf=bodybuf line "\n"
           ltop--
@@ -1031,8 +1032,25 @@ _restructure() {
         lbl=newlabel(); ltop++; ltype[ltop]="FOR"; llabel[ltop]=lbl; lvar[ltop]=fvar; llo[ltop]=lo
         bodybuf=bodybuf ind lbl ": WHILE " fvar " <= " hi " DO\n"; next
       }
-      if (line ~ /^[ \t]*FOR[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IN[ \t]+/) {       # 游标 FOR / REVERSE FOR（无数值 .. 范围）→ TODO
-        bodybuf=bodybuf line "\t-- TODO(需人工转换): 游标/REVERSE FOR..IN 需改 DECLARE CURSOR+LOOP/FETCH 或反向计数\n"; next
+      if (line ~ /^[ \t]*FOR[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IN[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+LOOP[ \t]*$/) {
+        # 游标 FOR rec IN cursor_name LOOP → OPEN + label:LOOP + FETCH + done check + body + END LOOP + CLOSE
+        # MySQL 无 RECORD 类型，FETCH INTO 需标量变量列表（无法从游标名推断列）→ TODO 标 FETCH 目标
+        ind=getindent(line); core=substr(line,length(ind)+1)
+        sub(/^FOR[ \t]+/,"",core); fvar=core; sub(/[ \t]+IN.*$/,"",fvar)              # fvar = rec 变量名
+        sub(/^[A-Za-z_][A-Za-z0-9_]*[ \t]+IN[ \t]+/,"",core)                           # core = "cursor_name LOOP"
+        cname=core; sub(/[ \t]+LOOP[ \t]*$/,"",cname)
+        done_needed=1
+        lbl=newlabel(); ltop++; ltype[ltop]="CFOR"; llabel[ltop]=lbl; lvar[ltop]=fvar; lcursor[ltop]=cname
+        bodybuf=bodybuf ind "OPEN " cname ";\n"
+        bodybuf=bodybuf ind lbl ": LOOP\n"
+        bodybuf=bodybuf ind "    FETCH " cname " INTO " fvar "; -- TODO(需人工转换): MySQL 无 RECORD 类型，须展开为标量变量列表（按游标 SELECT 列序）\n"
+        bodybuf=bodybuf ind "    IF done = 1 THEN LEAVE " lbl ";\n" ind "    END IF;\n"; next
+      }
+      if (line ~ /^[ \t]*FOR[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IN[ \t]+REVERSE[ \t]+/) {       # REVERSE FOR → TODO
+        bodybuf=bodybuf line "\t-- TODO(需人工转换): REVERSE FOR..IN 需改 WHILE 递减（hi→lo）\n"; next
+      }
+      if (line ~ /^[ \t]*FOR[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IN[ \t]+/) {       # 其他 FOR..IN（无法识别）→ TODO
+        bodybuf=bodybuf line "\t-- TODO(需人工转换): FOR..IN 需改 DECLARE CURSOR+LOOP/FETCH 或反向计数\n"; next
       }
       if (line ~ /^[ \t]*WHILE[ \t].*[ \t]LOOP[ \t]*$/) {                      # WHILE c LOOP → label: WHILE c DO
         lbl=newlabel(); ltop++; ltype[ltop]="WHILE"; llabel[ltop]=lbl
