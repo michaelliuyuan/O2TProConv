@@ -137,7 +137,21 @@ cp ora2tidb.conf.example ora2tidb.conf
 - sp_calc_bonus：VARCHAR(4000)×1，DECIMAL(65,30)×2
 - VARCHAR(4000)：Oracle 参数裸 VARCHAR2 → MySQL VARCHAR 须带长度（4000 安全默认，不按列推断）。
 - DECIMAL(65,30)：裸 NUMBER 安全兜底；高 scale NUMBER 有截断风险，请人工核对。
+
+## 语义差异 NOTE（已转但有已知差，需核对）
+- sp_xxx：SYS_GUID()→UUID()（32-hex vs 36 带连字符）
+- sp_yyy：MONTHS_BETWEEN→TIMESTAMPDIFF（小数月 vs 整数月截断）
+
+## TODO 明细（需人工转换项，按文件+行号定位）
+下列行被标记 `-- TODO(需人工转换)`——正则无法可靠转换，需人工处理。定位格式：`输出文件:L行号`。
+
+- **sp_calc_bonus**（sp_calc_bonus.tidb.sql:L12）：跨表达式 || 需人工或走 Route A
+- **sp_a**（sp_a.tidb.sql:L6）：%ROWTYPE 锚定类型需 schema 内省
+- **sp_a**（sp_a.tidb.sql:L8）：BULK COLLECT 需改游标循环
+- **sp_b**（sp_b.tidb.sql:L1）：EXECUTE IMMEDIATE 需转 PREPARE/EXECUTE
 ```
+
+> 报告含四段：① 逐过程状态表（TODO 计数）② 默认长度/精度填充 NOTE ③ 语义差异 NOTE ④ **TODO 明细**（按 `文件:L行号` 定位，直接跳转处理，无需手动 grep 输出文件）。
 
 ### 5. 部署到 TiDB —— ⚠️ Route A：`PIPES_AS_CONCAT`
 
@@ -321,13 +335,13 @@ DELIMITER ;
 
 **PACKAGE BODY 拆分**：export 默认导出 PACKAGE BODY（`EXPORT_OBJECT_TYPES` 含 `PACKAGE BODY`），convert 阶段 `_split_package_body` 检测 `CREATE OR REPLACE PACKAGE BODY` → 自动提取内部 PROCEDURE/FUNCTION 为独立 `.sql` 分别转换，PACKAGE 级变量/类型/游标声明不随子程序迁移（需人工，见 FAQ）。PACKAGE spec（仅声明）导出但不自动转换。
 
-**覆盖率**：T1+T2 常见 SP 定义 8/8 全自动转换（corpus 实测 CREATE + golden + 一致性通过）；复杂 T3（`%ROWTYPE` / BULK COLLECT / 动态 SQL / 集合 / 游标 FOR）标 `-- TODO` 走人工；PACKAGE BODY 自动拆分+转换。**诚实边界**：纯正则无法区分字符串字面量与代码、无法处理嵌套，强行转换比「提示人工」更坏——不可靠处留 `-- TODO`，均不臆造。
+**覆盖率**：T1+T2 常见 SP 定义 8/8 全自动转换（corpus 实测 CREATE + golden + 一致性通过）；复杂 T3（`%ROWTYPE` / BULK COLLECT / 动态 SQL / 集合 / 游标 FOR）标 `-- TODO` 走人工；PACKAGE BODY 自动拆分+转换。**诚实边界**：纯正则无法区分字符串字面量与代码、无法处理嵌套，强行转换比「提示人工」更坏——不可靠处留 `-- TODO`，均不臆造。转换报告含 **TODO 明细**段（按 `文件:L行号` 定位每条 TODO 原因），便于人工直接跳转处理，无需手动 grep 输出文件。
 
 ## 进度
 
 - [x] 仓库骨架 + `ora2tidb` 入口 + 配置（对齐设计文档）
 - [x] 模块1 export（sqlplus + `DBMS_METADATA.GET_DDL`；PROCEDURE/FUNCTION/PACKAGE BODY/PACKAGE，类型可配 `EXPORT_OBJECT_TYPES`）
-- [x] 模块2 convert（机械规则 + **结构层**：EXCEPTION→EXIT handler / 显式游标 / WHILE→DO / 数值 FOR / CONTINUE / `:=`→SET / DECLARE 序重排 + 忠实 `||`/`DECODE`(`<=>`) + 报告含默认长度 NOTE）
+- [x] 模块2 convert（机械规则 + **结构层**：EXCEPTION→EXIT handler / 显式游标 / WHILE→DO / 数值 FOR / CONTINUE / `:=`→SET / DECLARE 序重排 + 忠实 `||`/`DECODE`(`<=>`) + 报告含默认长度 NOTE + 语义差异 NOTE + **TODO 明细（文件:行号定位）**）
 - [x] M1 能力探针 6 个 + 运行器，**实跑通过**（TiDB v7.1.9，含 GET DIAGNOSTICS 实证）
 - [x] compare 用例格式契约 + `--validate-cases` 离线校验
 - [x] **T1+T2 验收**：8/8 CREATE + golden diff + 一致性通过（1/7→8/8）
