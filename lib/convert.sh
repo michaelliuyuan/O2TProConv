@@ -29,6 +29,7 @@ run_convert() {
 
   shopt -s nullglob
   local f base out todos status total=0 need_review=0
+  local note_section=""
   for f in "$ORACLE_DIR"/*.sql; do
     [[ "$(basename "$f")" == _* ]] && continue      # 跳过 _proc_list.tsv 等辅助文件
     base="$(basename "$f" .sql)"
@@ -38,6 +39,18 @@ run_convert() {
     total=$((total+1))
     if [[ "$todos" -gt 0 ]]; then status="需人工复核"; need_review=$((need_review+1)); else status="已自动转换"; fi
     printf '| %s | %s | %s |\n' "$base" "$status" "$todos" >>"$report"
+    # 默认长度/精度填充 NOTE（架构师 guardrail：不静默）——列出被填 VARCHAR(4000)/DECIMAL(65,30)
+    # 的参数/声明，避免掩盖真实长度/精度需求。post-hoc 扫描转换输出。
+    local vc dc
+    vc=$(grep -cE 'VARCHAR\(4000\)' "$out" || true)
+    dc=$(grep -cE 'DECIMAL\(65,30\)' "$out" || true)
+    if [[ "$vc" -gt 0 || "$dc" -gt 0 ]]; then
+      local note_line="  - **$base**："
+      [[ "$vc" -gt 0 ]] && note_line+="VARCHAR(4000)×${vc}"
+      [[ "$vc" -gt 0 && "$dc" -gt 0 ]] && note_line+="，"
+      [[ "$dc" -gt 0 ]] && note_line+="DECIMAL(65,30)×${dc}"
+      note_section+="${note_line}"$'\n'
+    fi
     log "  $base → $out（TODO: $todos）"
   done
   shopt -u nullglob
@@ -45,6 +58,19 @@ run_convert() {
   {
     echo
     echo "**合计**：$total 个过程，其中 $need_review 个需人工复核。"
+    echo
+    echo "## 默认长度/精度填充 NOTE（不静默）"
+    echo
+    if [[ -n "$note_section" ]]; then
+      echo "下列参数/声明被填了安全默认（裸 Oracle 类型 → MySQL 必须带长度/精度）："
+      echo
+      printf '%s' "$note_section"
+      echo
+      echo "- VARCHAR(4000)：Oracle PL/SQL 裸 VARCHAR2（参数禁精度）→ MySQL VARCHAR 必须带长度，4000 为安全默认（不按列推断）。真实长度需求请人工核对。"
+      echo "- DECIMAL(65,30)：裸 NUMBER → DECIMAL(65,30) 安全兜底（不做列精度推断）；高 scale NUMBER 有截断风险，请人工核对。"
+    else
+      echo "无默认填充（所有 VARCHAR2/NUMBER 均带显式长度/精度）。"
+    fi
   } >>"$report"
 
   info "转换完成：$total 个，需复核 $need_review 个；报告 $report"
@@ -64,18 +90,19 @@ convert_one() {
   text="$(_restructure    <<<"$text")"
   {
     echo "-- 由 oracle2tidb-sp 自动转换生成；请核对带 -- TODO(需人工转换) 的行"
-    # _rewrite_header 注入了真实 DROP 语句（首行）。把它提到 DELIMITER // 之前——
-    # 在默认分隔符下执行，幂等：反馈环每次 pull 新 hash 重跑不会因 duplicate 挂。
-    local first rest
-    if [[ "$text" == *$'\n'* ]]; then first="${text%%$'\n'*}"; rest="${text#*$'\n'}"; else first="$text"; rest=""; fi
-    if [[ "$first" =~ ^DROP[[:space:]]+(PROCEDURE|FUNCTION)[[:space:]]+IF[[:space:]]+EXISTS ]]; then
-      printf '%s\n' "$first"
-      echo "DELIMITER //"
-      [[ -n "$rest" ]] && printf '%s\n' "$rest"
+    # _rewrite_header 注入的真实 DROP 可能位于首部注释之后（源文件带头部注释）。
+    # 从任意位置抽出 DROP 行、提到 DELIMITER // 之前——默认分隔符下执行、幂等：
+    # 反馈环每次 pull 新 hash 重跑不会因 duplicate 挂；DROP 也不会被 // 分隔符吞掉成语法错。
+    local drop_line body_text
+    drop_line="$(printf '%s\n' "$text" | grep -m1 -E '^DROP[[:space:]]+(PROCEDURE|FUNCTION)[[:space:]]+IF[[:space:]]+EXISTS' || true)"
+    if [[ -n "$drop_line" ]]; then
+      body_text="$(printf '%s\n' "$text" | grep -v -E '^DROP[[:space:]]+(PROCEDURE|FUNCTION)[[:space:]]+IF[[:space:]]+EXISTS')"
+      printf '%s\n' "$drop_line"
     else
-      echo "DELIMITER //"
-      printf '%s\n' "$text"
+      body_text="$text"
     fi
+    echo "DELIMITER //"
+    printf '%s\n' "$body_text"
     echo "//"
     echo "DELIMITER ;"
   } >"$out"
@@ -85,8 +112,10 @@ convert_one() {
 _apply_mechanical() {
   sed -E \
     -e '/^[[:space:]]*--/b' \
-    -e 's/\bNVARCHAR2\b/NVARCHAR/gI' \
-    -e 's/\bVARCHAR2\b/VARCHAR/gI' \
+    -e 's/\bNVARCHAR2[ \t]*\(/NVARCHAR(/gI' \
+    -e 's/\bNVARCHAR2\b/NVARCHAR(4000)/gI' \
+    -e 's/\bVARCHAR2[ \t]*\(/VARCHAR(/gI' \
+    -e 's/\bVARCHAR2\b/VARCHAR(4000)/gI' \
     -e 's/\bNUMBER\(/DECIMAL(/gI' \
     -e 's/\bNUMBER\b/DECIMAL(65,30)/gI' \
     -e 's/\bPLS_INTEGER\b/INT/gI' \
@@ -114,6 +143,9 @@ _convert_known_semantics() {
   gawk '
     BEGIN { q = sprintf("%c", 39) }
     function trim(s){ sub(/^[ \t]+/,"",s); sub(/[ \t]+$/,"",s); return s }
+    # 抹掉字符串字面量（含 '' 转义），用于 unsafe 判定——避免字面量里的 = + - 等
+    # 字符被当成运算符误判 || 链 unsafe（如 v_ename||'='||v_sal 里的 '='）。
+    function strip_str(s,   r,n,i,c,nx,instr){ n=length(s); r=""; i=1; instr=0; while(i<=n){ c=substr(s,i,1); if(instr){ if(c==q){ nx=substr(s,i+1,1); if(nx==q){ i+=2; continue } else { instr=0; i++; continue } }; i++; continue } if(c==q){ instr=1; i++; continue } r=r c; i++ } return r }
     function match_paren(s, op,   n,i,depth,c,in_str,nx){
       n=length(s); depth=0; in_str=0
       for(i=op;i<=n;i++){
@@ -177,17 +209,17 @@ _convert_known_semantics() {
     function conv_concat(line,   out,re,m,pre,chain,rest,A,n,i,inner,cs,unsafe,rs,rl){
       # 动态正则里 \( \) \. \| 都会被当普通字符（gawk 警告），故字面量一律用方括号类：
       # [(] [)] [|] [.] —— 避免 || 被解析成两个交替运算符破坏链匹配。
-      re = "(:=|[(),])[ \t]*([A-Za-z_][A-Za-z0-9_.#$]*[(][^()]*[)]|[A-Za-z_][A-Za-z0-9_.#$]*|" q "[^" q "]*" q "|[0-9]+([.][0-9]+)?)([ \t]*[|][|][ \t]*([A-Za-z_][A-Za-z0-9_.#$]*[(][^()]*[)]|[A-Za-z_][A-Za-z0-9_.#$]*|" q "[^" q "]*" q "|[0-9]+([.][0-9]+)?))+"
+      re = "(:=|[(),]|(RETURN|SELECT|VALUES|WHERE|THEN|ELSE|WHEN)[ \t]+)[ \t]*([A-Za-z_][A-Za-z0-9_.#$]*[(][^()]*[)]|[A-Za-z_][A-Za-z0-9_.#$]*|" q "[^" q "]*" q "|[0-9]+([.][0-9]+)?)([ \t]*[|][|][ \t]*([A-Za-z_][A-Za-z0-9_.#$]*[(][^()]*[)]|[A-Za-z_][A-Za-z0-9_.#$]*|" q "[^" q "]*" q "|[0-9]+([.][0-9]+)?))+"
       out=""
       while(match(line,re)){
         rs=RSTART; rl=RLENGTH                         # match(m,...) 下面会覆盖全局 RSTART/RLENGTH，先存
         m=substr(line,rs,rl)
         rest=substr(line,rs+rl)
         if(rest !~ /^[ \t]*([;),]|$)/){ out=out substr(line,1,rs); line=substr(line,rs+1); continue }
-        if(match(m,/^(:=|[(),])[ \t]*/)){ pre=substr(m,1,RLENGTH); chain=substr(m,RLENGTH+1) } else { pre=""; chain=m }
+        if(match(m,/^(:=|[(),]|(RETURN|SELECT|VALUES|WHERE|THEN|ELSE|WHEN)[ \t]+)[ \t]*/)){ pre=substr(m,1,RLENGTH); chain=substr(m,RLENGTH+1) } else { pre=""; chain=m }
         n=split_pipes(chain,A)
         unsafe=0
-        for(i=1;i<=n;i++){ if(A[i] ~ /[+\-*/=<>]/ || A[i] ~ /(^|[^A-Za-z0-9_])(AND|OR|NOT|FROM|WHERE|SELECT|INTO|VALUES|THEN|ELSE|WHEN|CASE|END)([^A-Za-z0-9_]|$)/){ unsafe=1; break } }
+        for(i=1;i<=n;i++){ ss=strip_str(A[i]); if(ss ~ /[+\-*/=<>]/ || ss ~ /(^|[^A-Za-z0-9_])(AND|OR|NOT|FROM|WHERE|SELECT|INTO|VALUES|THEN|ELSE|WHEN|CASE|END)([^A-Za-z0-9_]|$)/){ unsafe=1; break } }
         if(unsafe){ todo=todo "|| 拼接含混运算符/关键字，操作数边界不可靠，需人工 CONCAT; "; out=out substr(line,1,rs+rl-1); line=rest; continue }
         inner=""
         for(i=1;i<=n;i++){ inner=(i==1?"":inner ", ") "IFNULL(" trim(A[i]) "," q q ")" }
@@ -229,7 +261,7 @@ _convert_known_semantics() {
       todo=""
       line=conv_decode(line)
       line=conv_concat(line)
-      if(code_has_pipe(line))   todo=todo "|| 拼接未能自动转换（跨行/复杂），需人工 CONCAT; "
+      if(code_has_pipe(line))   todo=todo "|| 拼接未能自动转换（SELECT 列表/跨行表达式边界不可靠）需人工 CONCAT；⚠️MySQL 默认 || = OR，残留即语义错（CREATE 能过但算错）! "
       if(code_has_decode(line)) todo=todo "DECODE 未能自动转换（跨行/畸形），需人工 CASE; "
       if(todo != "") print "-- TODO(需人工转换): " todo
       print line
@@ -292,9 +324,8 @@ _mark_complex() {
       if ($0 ~ /BULK[ \t]+COLLECT|FORALL/)       todo("批量操作 BULK COLLECT/FORALL 无直接对应，需改写为游标循环")
       if ($0 ~ /TO_CHAR[ \t]*\(/)                todo("TO_CHAR(number 或复杂参数) 无干净 MySQL 对应，需人工（DATE 形态已自动转 DATE_FORMAT）")
       if ($0 ~ /DBMS_OUTPUT/)                    todo("DBMS_OUTPUT 需改 SELECT 结果 / 写日志表")
-      if ($0 ~ /EXCEPTION[ \t]+WHEN/)            todo("异常 EXCEPTION WHEN 需改 DECLARE ... HANDLER")
-      if ($0 ~ /^[ \t]*EXCEPTION[ \t]*$/)        todo("异常块 EXCEPTION 需改 DECLARE ... HANDLER（跨行结构）")
-      if ($0 ~ /CURSOR[ \t]+[A-Za-z_]+[ \t]+IS/) todo("显式游标 CURSOR..IS 需改 DECLARE ... CURSOR FOR")
+      # 注：EXCEPTION 块（WHEN NO_DATA_FOUND/OTHERS）与显式游标 CURSOR..IS 现由 _restructure 自动转换
+      # （EXIT handler 提升 / DECLARE..CURSOR FOR + done 标志），此处不再标 TODO，避免残留假阳性。
       if ($0 ~ /[ \t]FOR[ \t]+.*[ \t]IN[ \t]+/)  todo("FOR..IN 循环：数值范围可转 WHILE，游标循环需改写，无法自动判定")
       print
     }
@@ -305,10 +336,11 @@ _mark_complex() {
 #   → 注入 DROP PROCEDURE IF EXISTS `name`; 并去掉 OR REPLACE。
 _rewrite_header() {
   awk '
-    BEGIN { IGNORECASE=1; dropped=0 }
+    BEGIN { IGNORECASE=1; dropped=0; isfunc=0 }
     /^create[ \t]+(or[ \t]+replace[ \t]+)?(procedure|function)[ \t]+/ {
       if (!dropped) {
         kind = ($0 ~ /^create[ \t]+(or[ \t]+replace[ \t]+)?function[ \t]+/) ? "FUNCTION" : "PROCEDURE"
+        isfunc = (kind == "FUNCTION")
         line=$0
         sub(/^create[ \t]+(or[ \t]+replace[ \t]+)?(procedure|function)[ \t]+/, "", line)
         name=line; sub(/[ \t(;].*$/, "", name)
@@ -318,8 +350,10 @@ _rewrite_header() {
         dropped=1
       }
       sub(/or[ \t]+replace[ \t]+/, "", $0)
-      if (kind == "FUNCTION") sub(/[ \t]RETURN[ \t]/, " RETURNS ")   # 头部 RETURN<type> → RETURNS<type>
     }
+    # FUNCTION 头部 RETURN<type> 子句 → RETURNS<type>。多行头也能命中：RETURN-type 子句以 IS/AS 收尾，
+    # body 的 RETURN<expr>; 不带 IS/AS 故不误伤（单行/多行 FUNCTION 头通用）。
+    isfunc && $0 ~ /RETURN[ \t]+[A-Za-z0-9_().]+[ \t]+(IS|AS)[ \t]*$/ { sub(/RETURN[ \t]+/, "RETURNS ") }
     { print }
   '
 }
@@ -340,6 +374,10 @@ _param_mode() {
         $0 = gensub(/([(, \t])([A-Za-z_][A-Za-z0-9_]*)[ \t]+(IN[ \t]+OUT|INOUT|IN|OUT)[ \t]+/, "\\1\\3 \\2 ", "g")
         gsub(/IN[ \t]+OUT/, "INOUT")
       }
+      # MySQL 函数参数禁 IN/OUT/INOUT：FUNCTION 参数区直接剥掉模式关键字，留 name type。
+      if (active && !closed && isfunc) {
+        $0 = gensub(/([A-Za-z_][A-Za-z0-9_]*)[ \t]+(IN[ \t]+OUT|INOUT|IN|OUT)[ \t]+/, "\\1 ", "g")
+      }
       depth += (no - nc)
       if (active && !closed && depth<=0 && (no>0||nc>0)) closed=1
       print
@@ -347,69 +385,126 @@ _param_mode() {
   '
 }
 
-# 结构改写 pass（架构师 spec：一个连贯的结构改写，不打逐条补丁）。
-# Oracle `CREATE ... name(...) [RETURN t] AS|IS <decls> BEGIN <body> END[name];`
-#   → MySQL `BEGIN DECLARE <decls>; <body> END`，配套：
-#   - 删 AS/IS（item 1）
-#   - 声明段移到 BEGIN 之后 + 加 DECLARE 前缀；声明段 `v T := x` → `DECLARE v T DEFAULT x`（item 4）
-#   - 执行段 `v := x` → `SET v = x`（item 3，`:=` 两态：声明段 DEFAULT / 执行段 SET）
-#   - `END[name];`/`END;` → `END`（item 5，但保留 END IF/LOOP/CASE/FOR）
-# 顶层结构按 AS/IS→BEGIN→END 状态机走；嵌套 DECLARE..BEGIN..END 尽力（顶层为主）。
-# 注释行（-- ...）原样透传，不参与状态机/改写。
+# 结构改写 pass（架构师 spec：连贯结构改写，全量缓冲后按 MySQL 序组装）。
+# Oracle `CREATE ... name(...) AS|IS <decls> BEGIN <body> [EXCEPTION ...] END;`
+#   → MySQL `BEGIN <vars+done/v_errmsg> <cursors> <handlers> <body> END`
+# 处理项：
+#   - 删 AS/IS；声明段 `v T := x`→`DECLARE v T DEFAULT x`
+#   - 显式游标 `CURSOR c IS <多行 SELECT;>`→`DECLARE c CURSOR FOR <SELECT;>`（按深度判定行止于 `;`）
+#   - body 控制流：`WHILE c LOOP`→`WHILE c DO`（加 label）；`LOOP`→`label: LOOP`；
+#     `EXIT WHEN c%NOTFOUND`→`IF done = 1 THEN LEAVE label`；`EXIT WHEN <cond>`→`IF <cond> THEN LEAVE label`；
+#     裸 `EXIT`→`LEAVE label`；`END LOOP`(WHILE)→`END WHILE`（loop 栈判型）
+#   - EXCEPTION 提升（架构 spec：块级 EXIT，非 CONTINUE）：NO_DATA_FOUND→`EXIT HANDLER FOR NOT FOUND`，
+#     OTHERS→`EXIT HANDLER FOR SQLEXCEPTION` + `GET DIAGNOSTICS CONDITION 1 v_errmsg = MESSAGE_TEXT`，`SQLERRM`→`v_errmsg`
+#   - fabricated：显式游标场景 `done INT DEFAULT 0` + `CONTINUE HANDLER FOR NOT FOUND SET done=1`；OTHERS 场景 `v_errmsg VARCHAR(255)`
+# 组装序严守 MySQL 强制 DECLARE 序：变量/条件（含 done/v_errmsg）→ 游标 → handler → body。
+# 注：顶层为主；嵌套 DECLARE..BEGIN..END / 自定义异常 CONDITION / RAISE_APPLICATION_ERROR / FOR..IN 未覆盖（标 known-limitation）。
 _restructure() {
   awk '
-    BEGIN { state="pre"; IGNORECASE=1 }
+    BEGIN { state="pre"; IGNORECASE=1; ltop=0; labeln=0; has_ndf=0; has_others=0; done_needed=0; in_cursor=0 }
+    function newlabel(){ labeln++; return "lp" labeln }
     function is_as_is_line(line) {
       return (line ~ /^[ \t]*(AS|IS)[ \t]*$/) || (line ~ /[)A-Za-z0-9_][ \t]+(AS|IS)[ \t]*$/)
+    }
+    function getindent(line){ if (match(line,/^[ \t]*/)) return substr(line,1,RLENGTH); return "" }
+    # SP 终止 END：`END`/`END;`/`END <spname>;`，排除块结束 END IF/LOOP/CASE/FOR/REPEAT/WHILE。
+    function is_sp_end(line) {
+      if (line ~ /^[ \t]*END[ \t]*;?[ \t]*$/) return 1
+      if (line ~ /^[ \t]*END[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*;?[ \t]*$/ && line !~ /^[ \t]*END[ \t]+(IF|LOOP|CASE|FOR|REPEAT|WHILE)([ \t;]|$)/) return 1
+      return 0
     }
     function conv_decl(line,   s) {
       s=line; sub(/^[ \t]+/,"",s); sub(/[ \t]+$/,"",s)
       if (s=="") return ""
-      if (s ~ /^CURSOR[ \t]/) return s "\t-- TODO(需人工转换): 游标声明 CURSOR..IS 需改 DECLARE..CURSOR FOR"
       sub(/[ \t]CONSTANT[ \t]+/, " ", s)                  # MySQL 无 CONSTANT
       gsub(/[ \t]*:=[ \t]*/, " DEFAULT ", s)               # 声明段 := → DEFAULT
       if (s !~ /^DECLARE[ \t]/) s="DECLARE " s
       return s
     }
     function conv_assign(line) {
-      # gsub/sub 不支持 \1 反向引用，用 gensub（缩进 target := → SET target = ）
       return gensub(/^([ \t]*)([A-Za-z_][A-Za-z0-9_.]*)[ \t]*:=[ \t]*/, "\\1SET \\2 = ", "g", line)
     }
-    function conv_end(line,   s) {
-      if (line ~ /^[ \t]*END[ \t]+(IF|LOOP|CASE|FOR|RECORD)[ \t]*;/) return line   # 保留块结束（END IF/LOOP/CASE/FOR）
-      s=line
-      if (s ~ /^[ \t]*END[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*;?[ \t]*$/) { sub(/[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*;?[ \t]*$/, "", s); return s }  # END name; → END
-      if (s ~ /^[ \t]*END[ \t]*;?[ \t]*$/) { sub(/;[ \t]*$/, "", s); return s }     # END; → END
-      return line                                                                  # 非 END 行原样（保留 ;）
+    # 组装：header(DROP+CREATE+params) → BEGIN → 变量(+done/v_errmsg) → 游标 → handler → body → END
+    function assemble(    h) {
+      printf "%s", hdrbuf
+      print "BEGIN"
+      if (varbuf != "")  printf "%s\n", varbuf
+      if (done_needed)   print "    DECLARE done INT DEFAULT 0;"
+      if (has_others)    print "    DECLARE v_errmsg VARCHAR(255);"
+      if (curbuf != "")  printf "%s\n", curbuf
+      h=""
+      if (done_needed) h = h "    DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;\n"
+      if (has_ndf)     h = h "    DECLARE EXIT HANDLER FOR NOT FOUND\n    BEGIN\n" ndf_body "    END;\n"
+      if (has_others)  h = h "    DECLARE EXIT HANDLER FOR SQLEXCEPTION\n    BEGIN\n        GET DIAGNOSTICS CONDITION 1 v_errmsg = MESSAGE_TEXT;\n" others_body "    END;\n"
+      if (h != "") printf "%s", h
+      if (bodybuf != "") printf "%s", bodybuf
+      print "END"
     }
     {
       line=$0
-      if (line ~ /^[ \t]*--/) { print line; next }            # 注释透传
+      if (line ~ /^[ \t]*--/) {                                              # 注释：按区缓冲（exception 区丢弃，corpus 无）
+        if (state=="pre")        hdrbuf  = (hdrbuf==""?"":hdrbuf)  line "\n"
+        else if (state=="decls") varbuf  = (varbuf==""?"":varbuf) "\n" line
+        else if (state=="body")  bodybuf = (bodybuf==""?"":bodybuf) line "\n"
+        next
+      }
       if (state=="pre") {
-        if (is_as_is_line(line)) { kept=line; sub(/[ \t]+(AS|IS)[ \t]*$/,"",kept); if (kept !~ /^[ \t]*$/) print kept; state="decls"; next }
-        if (line ~ /^[ \t]*BEGIN[ \t]*$/) { print line; state="body"; next }   # 无声明段直入 body
-        print line; next
+        if (is_as_is_line(line)) { kept=line; sub(/[ \t]+(AS|IS)[ \t]*$/,"",kept); if (kept !~ /^[ \t]*$/) hdrbuf=(hdrbuf==""?"":hdrbuf) kept "\n"; state="decls"; next }
+        hdrbuf = (hdrbuf==""?"":hdrbuf) line "\n"
+        next
       }
       if (state=="decls") {
-        if (line ~ /^[ \t]*BEGIN[ \t]*$/) {
-          print line
-          # TiDB v7.1.9 强制 DECLARE 序：变量/条件 → 游标 → handler（@测试 ERROR 1337 实证）。
-          # 本期处理声明段：var/condition 先、CURSOR 后；handler 槽留给 EXCEPTION→HANDLER（下期）。
-          if (varbuf!="")  print varbuf
-          if (curbuf!="")  print curbuf
-          varbuf=""; curbuf=""; state="body"; next
+        if (in_cursor) { curbuf=(curbuf==""?"":curbuf "\n") line; if (line ~ /;[ \t]*$/) in_cursor=0; next }
+        if (line ~ /^[ \t]*CURSOR[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IS/) {
+          done_needed=1
+          core=line; sub(/^[ \t]+/,"",core); sub(/^CURSOR[ \t]+/,"",core); cname=core; sub(/[ \t]+IS.*$/,"",cname)
+          rest=line; sub(/^[ \t]*CURSOR[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IS/,"",rest)
+          dline = "    DECLARE " cname " CURSOR FOR" (rest ~ /^[ \t]*$/ ? "" : rest)
+          curbuf=(curbuf==""?"":curbuf "\n") dline
+          if (line !~ /;[ \t]*$/) in_cursor=1
+          next
         }
-        d=conv_decl(line)
-        if (d=="") next
-        # 按强制序分类：游标(CURSOR)排后，其余(变量/条件)排前
-        if (line ~ /^[ \t]*CURSOR[ \t]/) curbuf=(curbuf==""?"":curbuf "\n") d
-        else                             varbuf=(varbuf==""?"":varbuf "\n") d
+        if (line ~ /^[ \t]*BEGIN[ \t]*$/) { state="body"; next }            # BEGIN 在 assemble() 里发
+        d=conv_decl(line); if (d=="") next; varbuf=(varbuf==""?"":varbuf "\n") d; next
+      }
+      if (state=="exception") {
+        if (line ~ /^[ \t]*WHEN[ \t]+OTHERS[ \t]+THEN/)        { exc_curr="others"; has_others=1; next }
+        if (line ~ /^[ \t]*WHEN[ \t]+NO_DATA_FOUND[ \t]+THEN/) { exc_curr="ndf";    has_ndf=1;     next }
+        if (line ~ /^[ \t]*WHEN[ \t]+/)                         { exc_curr="other";   next }   # 自定义/其他异常（本批不细映射）
+        if (is_sp_end(line)) { assemble(); state="end"; next }
+        l=conv_assign(line); gsub(/SQLERRM/, "v_errmsg", l)
+        if (exc_curr=="ndf")         ndf_body    = (ndf_body==""?"":ndf_body)    l "\n"
+        else if (exc_curr=="others") others_body = (others_body==""?"":others_body) l "\n"
         next
       }
       # state == body
-      line=conv_assign(line)
-      line=conv_end(line)
-      print line
+      if (line ~ /^[ \t]*EXCEPTION[ \t]*$/) { state="exception"; exc_curr=""; next }
+      if (line ~ /^[ \t]*END[ \t]+LOOP/) {                                     # END LOOP → END WHILE(若栈顶 WHILE) / END LOOP
+        if (ltop>0) { if (ltype[ltop]=="WHILE") { l=line; sub(/LOOP/, "WHILE", l); bodybuf=bodybuf l "\n" } else bodybuf=bodybuf line "\n"; ltop-- }
+        else bodybuf=bodybuf line "\n"
+        next
+      }
+      if (line ~ /^[ \t]*WHILE[ \t].*[ \t]LOOP[ \t]*$/) {                      # WHILE c LOOP → label: WHILE c DO
+        lbl=newlabel(); ltop++; ltype[ltop]="WHILE"; llabel[ltop]=lbl
+        ind=getindent(line); core=substr(line,length(ind)+1); sub(/[ \t]+LOOP[ \t]*$/, " DO", core)
+        bodybuf=bodybuf ind lbl ": " core "\n"; next
+      }
+      if (line ~ /^[ \t]*LOOP[ \t]*$/) {                                       # 裸 LOOP → label: LOOP
+        lbl=newlabel(); ltop++; ltype[ltop]="LOOP"; llabel[ltop]=lbl
+        ind=getindent(line); bodybuf=bodybuf ind lbl ": LOOP\n"; next
+      }
+      if (line ~ /^[ \t]*EXIT[ \t]+WHEN[ \t]+/) {                              # EXIT WHEN c%NOTFOUND → IF done=1 THEN LEAVE
+        ind=getindent(line); core=line; sub(/^[ \t]*EXIT[ \t]+WHEN[ \t]+/,"",core); sub(/;[ \t]*$/,"",core)
+        cond = (core ~ /[A-Za-z_][A-Za-z0-9_]*%NOTFOUND/ ? "done = 1" : core)
+        lbl=(ltop>0?llabel[ltop]:"lp1")
+        bodybuf=bodybuf ind "IF " cond " THEN\n" ind "    LEAVE " lbl ";\n" ind "END IF;\n"; next
+      }
+      if (line ~ /^[ \t]*EXIT[ \t]*;?[ \t]*$/) {                               # 裸 EXIT → LEAVE label
+        ind=getindent(line); lbl=(ltop>0?llabel[ltop]:"lp1")
+        bodybuf=bodybuf ind "LEAVE " lbl ";\n"; next
+      }
+      if (is_sp_end(line)) { assemble(); state="end"; next }
+      l=conv_assign(line); bodybuf=bodybuf l "\n"
     }
   '
 }
