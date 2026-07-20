@@ -296,13 +296,15 @@ DELIMITER ;
 
 | 维度 | 结果 |
 |------|------|
-| 编译 | **T1+T2 共 8/8 CREATE-OK** ✅ |
+| 编译 | **33/33 CREATE-OK** ✅（P1 功能扩展后全量回归：T1 机械层 3 / T2 忠实语义 6 / T3 结构改写 6 / T4 P1 新功能 7 / T5 边界+TODO 11，基于 `42464c5`+Bug #1-6 修复） |
 | golden 语义 | 通过（仅反引号 / `//` / DETERMINISTIC 格式差）✅ |
-| 结果一致性 | **单次连贯 33/33 全绿 @ `c9c2718`**（一个 mysql session、33 CALL、归一化后 vs Oracle 基线零 diff；覆盖 11 SP：T1×16 + T2×17）✅ |
-| T3 标记 | `%ROWTYPE` / BULK COLLECT / EXECUTE IMMEDIATE / 集合 / 游标 FOR 全标 TODO ✅；PACKAGE（spec+body）→ ⚠️ 转换失败/需人工（defensive check，Phase 2/T3 支持） |
+| 结果一致性 | **两端 CALL 17/17 全绿**（Oracle 23ai Free `rocky237` vs TiDB v7.1.9 `rocky231`，13 SP / 17 用例，同 schema + 同入参，归一化后零 diff；覆盖 DECODE/NVL/`||`/EXCEPTION/显式游标（含复合 EXIT WHEN）/WHILE/FOR/REVERSE FOR/CONTINUE/INOUT/FUNCTION/ELSIF/TO_CHAR）✅ |
+| T3 标记 | `%ROWTYPE` / BULK COLLECT（含关联 TYPE 声明）/ EXECUTE IMMEDIATE INTO / 集合 / 内联游标 FOR 全标 TODO ✅；PACKAGE BODY 自动拆分+转换 |
 | 性能 | 报告产出 ✅ |
 
-**结构层转换逐条实证正确**：EXCEPTION→EXIT handler（NOT_FOUND 分叉对）、显式游标（top1 降序 + 0 行）、WHILE 分页、FUNCTION/INOUT、NULL-`||` 忠实写法、DECODE-`<=>`（NULL-search 实证 `<=>` 必要：simple CASE 漏判）、数值 FOR（含 1..0 空循环）、CONTINUE（前置递增无死循环）。
+> **历史基线**：M2 阶段单次连贯 33/33 @ `c9c2718`（Route A，11 SP：T1×16 + T2×17）。P1 功能扩展（`%TYPE`/游标 FOR/EXECUTE IMMEDIATE/LISTAGG/REVERSE FOR）+ Bug #1-6 修复后，当前基线为 33/33 CREATE + 17/17 两端 CALL 一致（基于 `42464c5`）。
+
+**结构层转换逐条实证正确**（两端 CALL 验证）：EXCEPTION→EXIT handler（NOT_FOUND 分叉对）、显式游标（top3 + 复合 EXIT WHEN `done=1 OR v_count>=3`）、WHILE、FUNCTION/INOUT、NULL-`||` 忠实写法、DECODE-`<=>`（NULL-search 实证 `<=>` 必要）、数值 FOR（含 REVERSE FOR 递减）、CONTINUE（前置递增/递减防死循环）、`%TYPE` schema 内省解析、EXECUTE IMMEDIATE PREPARE/EXECUTE/DEALLOCATE、LISTAGG→GROUP_CONCAT。
 
 ### 测试中回流修复的 7 个 converter bug
 
@@ -316,7 +318,18 @@ DELIMITER ;
 | 6 | 显式游标 CURSOR..IS 未转 | `ab04900` → `27527b6` |
 | 7 | 单行 FUNCTION 头 RETURN→RETURNS（type 正则漏逗号） | `27527b6` → `7dff66b` |
 
-> 测试语料库（companion 目录 `ora2tidb-sp-tests/`，由测试工程师维护）：17 个分级 Oracle SP 样例（T1×6 / T2×5 / T3×6）+ golden + 用例 + 共享 schema + 测试计划。分级 = 转换置信度（T1 简单 / T2 中等 / T3 复杂预期 TODO）。详细结果见语料库 `results/`。
+### P1 功能扩展回归修复的 6 个 bug（两端 CALL + 全量回归发现）
+
+| # | bug | 修复 commit |
+|---|-----|-------------|
+| 1 | 嵌套 DECLARE..BEGIN..END 空输出（`is_top_begin` 未检查 `in_nested` + `nested_depth--` 时机错） | `2201324` |
+| 2 | FOR 计数器隐式变量未注入 DECLARE（assemble 未注入未声明的 FOR 变量） | `884f971` |
+| 3 | 无参 SP 游标 FOR 语法损坏（`_param_mode` 无参 SP 参数区不关闭，误改 body 的 `FOR rec IN c_emp`） | `2af9c56` |
+| 4 | PACKAGE BODY 子程序重复输出（`_split_package_body` END 检测误匹配 pkg END） | `0283a44` |
+| 5 | BULK COLLECT 关联 TYPE 声明未标 TODO（`_mark_complex` 未检测 `TYPE..IS TABLE OF/RECORD/VARRAY`） | `0283a44` |
+| 6 | EXIT WHEN 复合条件丢失（`%NOTFOUND` 整体替换为 `done=1`，丢弃 `OR` 条件） | `42464c5` |
+
+> 测试语料库（companion 目录 `ora2tidb-sp-tests/`，由测试工程师维护）：17 个分级 Oracle SP 样例（T1×6 / T2×5 / T3×6）+ golden + 用例 + 共享 schema + 测试计划。分级 = 转换置信度（T1 简单 / T2 中等 / T3 复杂预期 TODO）。P1 扩展后回归语料库扩为 33 SP（5 组：T1机械/T2忠实/T3结构/T4 P1新功能/T5边界+TODO）。详细结果见语料库 `results/`。
 
 ## 里程碑（设计文档 §7）
 
