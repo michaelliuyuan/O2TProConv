@@ -270,7 +270,7 @@ DELIMITER ;
 | 编译 | **T1+T2 共 8/8 CREATE-OK** ✅ |
 | golden 语义 | 通过（仅反引号 / `//` / DETERMINISTIC 格式差）✅ |
 | 结果一致性 | **单次连贯 33/33 全绿 @ `c9c2718`**（一个 mysql session、33 CALL、归一化后 vs Oracle 基线零 diff；覆盖 11 SP：T1×16 + T2×17）✅ |
-| T3 标记 | PACKAGE / `%ROWTYPE` / BULK COLLECT / EXECUTE IMMEDIATE / 集合 / 游标 FOR 全标 TODO ✅ |
+| T3 标记 | `%ROWTYPE` / BULK COLLECT / EXECUTE IMMEDIATE / 集合 / 游标 FOR 全标 TODO ✅；PACKAGE（spec+body）→ ⚠️ 转换失败/需人工（defensive check，Phase 2/T3 支持） |
 | 性能 | 报告产出 ✅ |
 
 **结构层转换逐条实证正确**：EXCEPTION→EXIT handler（NOT_FOUND 分叉对）、显式游标（top1 降序 + 0 行）、WHILE 分页、FUNCTION/INOUT、NULL-`||` 忠实写法、DECODE-`<=>`（NULL-search 实证 `<=>` 必要：simple CASE 漏判）、数值 FOR（含 1..0 空循环）、CONTINUE（前置递增无死循环）。
@@ -309,7 +309,7 @@ DELIMITER ;
 
 **⚠️ DECLARE 顺序**（@测试工程师 抓的坑，已纳入）：转换器生成声明时按 **变量/条件 → 游标 → handler（handler 最后）**，capability 探针 `02_declare_order.sql` 实证。
 
-**覆盖率**：T1+T2 常见 SP 定义 8/8 全自动转换（corpus 实测 CREATE + golden + 一致性通过）；复杂 T3（PACKAGE / `%ROWTYPE` / BULK COLLECT / 动态 SQL / 集合 / 游标 FOR）标 TODO 走人工。**诚实边界**：纯正则无法区分字符串字面量与代码、无法处理嵌套，强行转换比「提示人工」更坏——不可靠处留 `-- TODO` 不臆造。
+**覆盖率**：T1+T2 常见 SP 定义 8/8 全自动转换（corpus 实测 CREATE + golden + 一致性通过）；复杂 T3（`%ROWTYPE` / BULK COLLECT / 动态 SQL / 集合 / 游标 FOR）标 `-- TODO` 走人工；**PACKAGE（spec+body 头部 parse 不了）输出空 → defensive check 标「⚠️ 转换失败/需人工」**（非「已自动转换」假象；Phase 2/T3 支持）。**诚实边界**：纯正则无法区分字符串字面量与代码、无法处理嵌套，强行转换比「提示人工」更坏——不可靠处留 `-- TODO`，parse 不了的头部标失败，均不臆造。
 
 ## 进度
 
