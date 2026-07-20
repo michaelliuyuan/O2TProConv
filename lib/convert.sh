@@ -124,6 +124,9 @@ _apply_mechanical() {
     -e 's/\bNVL\(/IFNULL(/gI' \
     -e 's/\bSYSDATE\b/NOW()/gI' \
     -e 's/\bSYSTIMESTAMP\b/CURRENT_TIMESTAMP(6)/gI' \
+    -e 's/\bLENGTH[ \t]*\(/CHAR_LENGTH(/gI' \
+    -e 's/\bCHR[ \t]*\(/CHAR(/gI' \
+    -e 's/\bSYS_GUID[ \t]*\(\)/UUID()/gI' \
     -e 's/\bELSIF\b/ELSEIF/gI' \
     -e 's/^\/$//'                       # 去掉 Oracle 的 `/` 执行终止行
   # 说明：|| 与 DECODE 现由 _convert_known_semantics 做「忠实版自动转换」（已知语义差，默认开启）；
@@ -231,6 +234,51 @@ _convert_known_semantics() {
       }
       return out line
     }
+    # NVL2(a,b,c) → IF(a IS NOT NULL, b, c)（a 非 NULL 返回 b，否则 c）。3 参，按括号深度切分。
+    function conv_nvl2(line,   out,pos,prev,cpos,epos,mid,A,n){
+      out=""
+      while(match(line,/NVL2[ \t]*\(/)){
+        pos=RSTART
+        if(pos>1){ prev=substr(line,pos-1,1); if(prev~/[A-Za-z0-9_]/){ out=out substr(line,1,pos); line=substr(line,pos+1); continue } }
+        cpos=pos+RLENGTH-1; epos=match_paren(line,cpos)
+        if(epos==0){ todo=todo "NVL2 跨行需人工 IF; "; out=out line; return out }
+        mid=substr(line,cpos+1,epos-cpos-1); n=split_topcomma(mid,A)
+        if(n!=3){ out=out substr(line,1,epos); line=substr(line,epos+1); continue }
+        out=out substr(line,1,pos-1) "IF(" trim(A[1]) " IS NOT NULL, " trim(A[2]) ", " trim(A[3]) ")"
+        line=substr(line,epos+1)
+      }
+      return out line
+    }
+    # ADD_MONTHS(d,n) → DATE_ADD(d, INTERVAL n MONTH)。2 参。
+    function conv_add_months(line,   out,pos,prev,cpos,epos,mid,A,n){
+      out=""
+      while(match(line,/ADD_MONTHS[ \t]*\(/)){
+        pos=RSTART
+        if(pos>1){ prev=substr(line,pos-1,1); if(prev~/[A-Za-z0-9_]/){ out=out substr(line,1,pos); line=substr(line,pos+1); continue } }
+        cpos=pos+RLENGTH-1; epos=match_paren(line,cpos)
+        if(epos==0){ todo=todo "ADD_MONTHS 跨行需人工 DATE_ADD; "; out=out line; return out }
+        mid=substr(line,cpos+1,epos-cpos-1); n=split_topcomma(mid,A)
+        if(n!=2){ out=out substr(line,1,epos); line=substr(line,epos+1); continue }
+        out=out substr(line,1,pos-1) "DATE_ADD(" trim(A[1]) ", INTERVAL " trim(A[2]) " MONTH)"
+        line=substr(line,epos+1)
+      }
+      return out line
+    }
+    # MONTHS_BETWEEN(a,b) → TIMESTAMPDIFF(MONTH, b, a)——⚠️参数位置反转（Oracle(end,start) vs TiDB(unit,start,end)）。
+    function conv_months_between(line,   out,pos,prev,cpos,epos,mid,A,n){
+      out=""
+      while(match(line,/MONTHS_BETWEEN[ \t]*\(/)){
+        pos=RSTART
+        if(pos>1){ prev=substr(line,pos-1,1); if(prev~/[A-Za-z0-9_]/){ out=out substr(line,1,pos); line=substr(line,pos+1); continue } }
+        cpos=pos+RLENGTH-1; epos=match_paren(line,cpos)
+        if(epos==0){ todo=todo "MONTHS_BETWEEN 跨行需人工 TIMESTAMPDIFF; "; out=out line; return out }
+        mid=substr(line,cpos+1,epos-cpos-1); n=split_topcomma(mid,A)
+        if(n!=2){ out=out substr(line,1,epos); line=substr(line,epos+1); continue }
+        out=out substr(line,1,pos-1) "TIMESTAMPDIFF(MONTH, " trim(A[2]) ", " trim(A[1]) ")"
+        line=substr(line,epos+1)
+      }
+      return out line
+    }
     function code_has_pipe(s,   n,i,c,depth,in_str,nx){
       n=length(s); depth=0; in_str=0
       for(i=1;i<=n;i++){
@@ -263,6 +311,9 @@ _convert_known_semantics() {
       todo=""
       line=conv_decode(line)
       line=conv_concat(line)
+      line=conv_nvl2(line)
+      line=conv_add_months(line)
+      line=conv_months_between(line)
       if(code_has_pipe(line))   todo=todo "|| 保留字面（SELECT 列表/跨行表达式边界不可靠，未自动转）；目标库须 sql_mode 含 PIPES_AS_CONCAT 且 SP 须此模式下 CREATE（创建时锁定），否则 ||=OR 算错；含 NULL 操作数时改 CONCAT(IFNULL)（简单 || 已自动转）; "
       if(code_has_decode(line)) todo=todo "DECODE 未能自动转换（跨行/畸形），需人工 CASE; "
       if(todo != "") print "-- TODO(需人工转换): " todo
@@ -272,11 +323,12 @@ _convert_known_semantics() {
 }
 
 # TO_CHAR(date,'mask')→DATE_FORMAT(date,'%mask')：clean-auto（确定性掩码映射，对齐设计文档 §5.2）。
-# 仅处理第一参数无逗号/括号的常见日期形态；剩余 TO_CHAR(number/复杂) 由 _mark_complex 标 TODO。
+# 仅处理第一参数无逗号/括号的常见形态；剩余 TO_CHAR(number/复杂)/TO_DATE(复杂) 由 _mark_complex 标 TODO。
+# 同时覆盖 TO_CHAR(date,'mask')→DATE_FORMAT 与 TO_DATE(str,'mask')→STR_TO_DATE（mask 映射同）。
 # 必须在 _apply_mechanical（SYSDATE→NOW）之前跑，否则 NOW() 带括号匹配不到。
 _tochar_date() {
   awk '
-    BEGIN { q = sprintf("%c", 39); re = "TO_CHAR\\([^,()]*,[ \\t]*" q "[^" q "]*" q }
+    BEGIN { q = sprintf("%c", 39); re = "(TO_CHAR|TO_DATE)\\([^,()]*,[ \\t]*" q "[^" q "]*" q }
     function mapmask(s,   r) {
       r = s
       gsub(/YYYY/, "%Y", r); gsub(/YY/, "%y", r)
@@ -290,12 +342,13 @@ _tochar_date() {
       if ($0 ~ /^[ \t]*--/) { print; next }      # 跳过注释行（不在注释里做转换）
       while (match($0, re)) {
         whole = substr($0, RSTART, RLENGTH)
+        fn = (substr(whole,1,7) == "TO_DATE") ? "STR_TO_DATE" : "DATE_FORMAT"
         p = index(whole, ",")
         arg = substr(whole, 9, p - 9)
         m = substr(whole, p + 1); sub(/^[ \t]*/, "", m); gsub(q, "", m)
         mm = mapmask(m)
-        if (mm == m) break                              # 无日期 token → 非 date，留给 TODO
-        rep = "DATE_FORMAT(" arg ", " q mm q            # 不含结尾 ")"，原 ")" 保留
+        if (mm == m) break                              # 无日期 token → 留给 TODO
+        rep = fn "(" arg ", " q mm q                    # 不含结尾 ")"，原 ")" 保留
         $0 = substr($0, 1, RSTART - 1) rep substr($0, RSTART + RLENGTH)
       }
       print
@@ -324,7 +377,13 @@ _mark_complex() {
       if ($0 ~ /%TYPE|%ROWTYPE/)                 todo("锚定类型 %TYPE/%ROWTYPE 需解析为具体类型")
       if ($0 ~ /EXECUTE[ \t]+IMMEDIATE/)         todo("动态 SQL EXECUTE IMMEDIATE 需改 PREPARE/EXECUTE/DEALLOCATE")
       if ($0 ~ /BULK[ \t]+COLLECT|FORALL/)       todo("批量操作 BULK COLLECT/FORALL 无直接对应，需改写为游标循环")
-      if ($0 ~ /TO_CHAR[ \t]*\(/)                todo("TO_CHAR(number 或复杂参数) 无干净 MySQL 对应，需人工（DATE 形态已自动转 DATE_FORMAT）")
+      if ($0 ~ /(^|[^A-Za-z0-9_])TO_CHAR[ \t]*\(/)  todo("TO_CHAR(number 或复杂参数) 无干净 MySQL 对应，需人工（DATE 形态已自动转 DATE_FORMAT）")
+      if ($0 ~ /(^|[^A-Za-z0-9_])TO_NUMBER[ \t]*\(/) todo("TO_NUMBER 需改 CONVERT(.., type) 或 CAST，需人工指明目标类型")
+      if ($0 ~ /(^|[^A-Za-z0-9_])TO_DATE[ \t]*\(/)  todo("TO_DATE(复杂参数/无掩码) 需人工 STR_TO_DATE（简单 TO_DATE(str,'mask') 已自动转 STR_TO_DATE，此处排除 STR_TO_DATE 子串假阳性）")
+      if ($0 ~ /(^|[^A-Za-z0-9_])TRUNC[ \t]*\(/)    todo("TRUNC 歧义：数值→TRUNCATE / 日期→CAST AS DATE 或月初，需按参数类型人工判定")
+      if ($0 ~ /(^|[^A-Za-z0-9_])INSTR[ \t]*\(/)    todo("INSTR 多参数形态需按参数改 INSTR/LOCATE/SUBSTRING_INDEX，无法自动判定")
+      if ($0 ~ /LISTAGG/)                        todo("LISTAGG(..) WITHIN GROUP(ORDER BY ..) 需改 GROUP_CONCAT(.. ORDER BY .. SEPARATOR ..)")
+      if ($0 ~ /\.NEXTVAL/)                      todo("sequence.NEXTVAL 需改 NEXTVAL(sequence)（TiDB 序列语法）")
       if ($0 ~ /DBMS_OUTPUT/)                    todo("DBMS_OUTPUT 需改 SELECT 结果 / 写日志表")
       # 注：EXCEPTION 块（WHEN NO_DATA_FOUND/OTHERS）/ 显式游标 CURSOR..IS / 数值 FOR..IN 现由 _restructure
       # 自动转换（EXIT handler / DECLARE..CURSOR FOR + done / WHILE+计数器）；游标/REVERSE FOR 在 _restructure
