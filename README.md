@@ -5,7 +5,7 @@
 
 ## 能力（设计文档 §1）
 
-1. **export**：配 Oracle 连接 → 拉存储过程定义 → 导出 `.sql`。
+1. **export**：配 Oracle 连接 → 拉 PROCEDURE/FUNCTION/PACKAGE BODY/PACKAGE 定义 → 导出 `.sql`（类型可配，见 `EXPORT_OBJECT_TYPES`）。
 2. **convert**：Oracle（PL/SQL）SP → TiDB 语法 SP（+ 转换置信度报告）。
 3. **compare**：配 Oracle + TiDB → 跑 SP → 性能 + 结果一致性对比 → 报告。
 4. **capability**：M1 硬前置，对目标 TiDB 跑能力探针。
@@ -46,7 +46,7 @@ oracle2tidb-sp/
 ├── bin/ora2tidb             # 主入口：export|convert|compare|capability|all
 ├── lib/
 │   ├── common.sh           # 日志/配置/依赖/DB 客户端封装
-│   ├── export_oracle.sh    # 模块1：Oracle SP → .sql（DBMS_METADATA.GET_DDL）
+│   ├── export_oracle.sh    # 模块1：Oracle 对象 → .sql（DBMS_METADATA.GET_DDL；PROCEDURE/FUNCTION/PACKAGE BODY/PACKAGE，类型可配）
 │   ├── convert.sh          # 模块2：PL/SQL → TiDB（机械规则 + TODO 标记 + 报告）
 │   └── compare.sh          # 模块3：对比（已就绪：用例校验；待 M3：执行）
 ├── capability-check/        # M1：TiDB 能力探针（6 探针 + 运行器）
@@ -76,6 +76,7 @@ cp ora2tidb.conf.example ora2tidb.conf
 #   ORACLE_USER/PASS/HOST/PORT/SERVICE   Oracle 连接（export 导出 + compare 对比）
 #   TIDB_USER/PASS/HOST/PORT/DB           TiDB 连接（compare 对比 + capability 探针）
 #   EXPORT_DIR/CONVERTED_DIR/REPORT_DIR   产物目录（相对项目根，也可绝对路径）
+#   EXPORT_OBJECT_TYPES                   导出对象类型（冒号分隔；留空=默认 PROCEDURE:FUNCTION:PACKAGE BODY:PACKAGE）
 ```
 
 ### 2. 能力探针（capability）—— 验目标 TiDB 支持
@@ -98,11 +99,13 @@ cp ora2tidb.conf.example ora2tidb.conf
 
 > 06 失败是**预期**——TiDB 不支持裸 `:=` 赋值，坐实转换器 `:=`→`SET` 必要性。02 实证 MySQL/TiDB DECLARE 强制序（变量/条件 → 游标 → handler）。`GET DIAGNOSTICS`（OTHERS handler 用）未在矩阵内，已单测确认支持。
 
-### 3. 导出 Oracle SP（export）
+### 3. 导出 Oracle 对象（export）
 
 ```bash
 ./bin/ora2tidb export -c ora2tidb.conf
-# DBMS_METADATA.GET_DDL('PROCEDURE'|'FUNCTION', name, owner) → exported/<OWNER>.<NAME>.sql
+# 默认按 EXPORT_OBJECT_TYPES（PROCEDURE:FUNCTION:PACKAGE BODY:PACKAGE）逐类型
+# DBMS_METADATA.GET_DDL 拉完整 DDL → exported/<OWNER>.<NAME>.sql
+# PACKAGE BODY 的 DDL 会被 convert 阶段 _split_package_body 自动拆分（见 FAQ）
 ```
 
 ### 4. 转换（convert）—— PL/SQL → TiDB + 报告
@@ -307,14 +310,14 @@ DELIMITER ;
 
 **自动标记 `-- TODO(需人工转换)`**：跨表达式/跨行 `||`（**Route A 下留字面交 PIPES_AS_CONCAT**，TODO 标部署要求——见 Usage Step 5）、`%TYPE/%ROWTYPE`、`EXECUTE IMMEDIATE`、`BULK COLLECT/FORALL`、`TO_CHAR(number/复杂)`、`DBMS_OUTPUT`、游标/REVERSE `FOR..IN`、`GOTO`（MySQL 不支持）、嵌套 `DECLARE..BEGIN..END`（含 EXCEPTION 的复杂嵌套块）。
 
-**PACKAGE BODY 拆分**：Oracle PACKAGE BODY 含多个 PROCEDURE/FUNCTION → 自动提取为独立 `.sql` 文件分别转换。PACKAGE 级变量/类型/游标声明不随子程序迁移，需人工处理。PACKAGE spec（仅声明）暂不支持。
+**PACKAGE BODY 拆分**：export 默认导出 PACKAGE BODY（`EXPORT_OBJECT_TYPES` 含 `PACKAGE BODY`），convert 阶段 `_split_package_body` 检测 `CREATE OR REPLACE PACKAGE BODY` → 自动提取内部 PROCEDURE/FUNCTION 为独立 `.sql` 分别转换，PACKAGE 级变量/类型/游标声明不随子程序迁移（需人工，见 FAQ）。PACKAGE spec（仅声明）导出但不自动转换。
 
 **覆盖率**：T1+T2 常见 SP 定义 8/8 全自动转换（corpus 实测 CREATE + golden + 一致性通过）；复杂 T3（`%ROWTYPE` / BULK COLLECT / 动态 SQL / 集合 / 游标 FOR）标 `-- TODO` 走人工；PACKAGE BODY 自动拆分+转换。**诚实边界**：纯正则无法区分字符串字面量与代码、无法处理嵌套，强行转换比「提示人工」更坏——不可靠处留 `-- TODO`，均不臆造。
 
 ## 进度
 
 - [x] 仓库骨架 + `ora2tidb` 入口 + 配置（对齐设计文档）
-- [x] 模块1 export（sqlplus + `DBMS_METADATA.GET_DDL`）
+- [x] 模块1 export（sqlplus + `DBMS_METADATA.GET_DDL`；PROCEDURE/FUNCTION/PACKAGE BODY/PACKAGE，类型可配 `EXPORT_OBJECT_TYPES`）
 - [x] 模块2 convert（机械规则 + **结构层**：EXCEPTION→EXIT handler / 显式游标 / WHILE→DO / 数值 FOR / CONTINUE / `:=`→SET / DECLARE 序重排 + 忠实 `||`/`DECODE`(`<=>`) + 报告含默认长度 NOTE）
 - [x] M1 能力探针 6 个 + 运行器，**实跑通过**（TiDB v7.1.9，含 GET DIAGNOSTICS 实证）
 - [x] compare 用例格式契约 + `--validate-cases` 离线校验
@@ -325,3 +328,37 @@ DELIMITER ;
 - [x] 嵌套 DECLARE..BEGIN..END 转换（简单嵌套块→MySQL `BEGIN..END`；含 EXCEPTION 的标 TODO）
 - [x] PACKAGE BODY 拆分（自动提取内部 PROCEDURE/FUNCTION 为独立文件分别转换）
 - [ ] deferred：T3 族（%ROWTYPE·BULK COLLECT·动态 SQL·集合·游标 FOR 自动转换）、GOTO→unsupported TODO
+
+## 常见问题（FAQ）
+
+### Q: `EXPORT_OBJECT_TYPES` 怎么配？默认导出哪些类型？
+
+`EXPORT_OBJECT_TYPES` 控制 export 阶段从 Oracle 拉取的对象类型，**冒号分隔**（因 `'PACKAGE BODY'` 含空格，不能用空格/逗号分隔）。留空走默认：`PROCEDURE:FUNCTION:PACKAGE BODY:PACKAGE`。
+
+- PROCEDURE / FUNCTION → convert 直接转换
+- PACKAGE BODY → convert 的 `_split_package_body` 拆分为独立子程序文件后分别转换
+- PACKAGE spec（仅声明）→ 导出但不自动转换
+
+可配子集，如只导 PACKAGE BODY 验证拆分链路：`EXPORT_OBJECT_TYPES=PACKAGE BODY`。非法值（如拼写错或用逗号分隔）会直接 `die` 拒绝运行，避免 `PACKAGE BODY` 被空格拆成两个 token 导致查询失败。
+
+### Q: PACKAGE BODY 拆分后，PACKAGE 级变量/类型/游标怎么处理？
+
+当前 `_split_package_body` 仅自动提取 PACKAGE BODY 内的 PROCEDURE/FUNCTION 子程序，**PACKAGE 级变量/类型/游标声明不随子程序迁移**——这些是子程序间共享的全局状态，TiDB 无对应概念，需人工评估处理：
+
+- 简单常量/标量变量 → 评估是否在各子程序内重复声明，或改用 TiDB 会话变量
+- PACKAGE 级 TYPE/RECORD → 映射为临时表或 JSON 结构（见 T3 族 TODO）
+- PACKAGE 级游标 → 迁移到使用它的子程序内
+
+PACKAGE spec（声明部分）目前只导出不自动转换。
+
+### Q: 嵌套 DECLARE..BEGIN..END 能自动转换吗？
+
+能。Oracle 嵌套块 `DECLARE <decls> BEGIN <body> END` 会自动转为 MySQL `BEGIN DECLARE <decls> <body> END`。嵌套块内的 `:=` 转为 `DEFAULT`。嵌套 EXCEPTION 暂标 TODO，需人工处理。
+
+### Q: 转换报告里的 `-- TODO` 是什么意思？
+
+`-- TODO` 表示转换器无法可靠自动转换该处（如 `%ROWTYPE`、`EXECUTE IMMEDIATE`、`BULK COLLECT`、跨行 `||` 等），需人工介入。详见「转换覆盖」章节的诚实边界策略。
+
+### Q: 性能对比结果 TiDB 比 Oracle 慢很多？
+
+Oracle PL/SQL 原生循环调用接近 0 开销，TiDB 每次 `CALL` 约 3.5ms 调度开销。SP-heavy OLTP 场景迁移需评估此差异。建议使用 `PERF_WARMUP`（预热）和 `PERF_REPEAT`（重复次数）获取稳定数据。
