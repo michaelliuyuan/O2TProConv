@@ -28,7 +28,7 @@ run_convert() {
   } >"$report"
 
   shopt -s nullglob
-  local f base out todos status total=0 need_review=0
+  local f base out todos status total=0 need_review=0 failed=0
   local note_section="" sem_section=""
   for f in "$ORACLE_DIR"/*.sql; do
     [[ "$(basename "$f")" == _* ]] && continue      # 跳过 _proc_list.tsv 等辅助文件
@@ -37,7 +37,11 @@ run_convert() {
     convert_one "$f" "$out"
     todos=$(grep -c '^-- TODO(' "$out" || true)
     total=$((total+1))
-    if [[ "$todos" -gt 0 ]]; then status="需人工复核"; need_review=$((need_review+1)); else status="已自动转换"; fi
+    # defensive check（@架构师 建议，非静默）：输出缺 CREATE PROCEDURE|FUNCTION = parse 不了的头部结构
+    # （如 inline-decl `AS v_x TYPE;` 单行）→ SP 整个消失是 silent failure，比语义边更重。标失败 + 计数。
+    if ! grep -qE '^CREATE[[:space:]]+(PROCEDURE|FUNCTION)' "$out"; then
+      status="⚠️ 转换失败/空输出（头部 parse 不了？）需人工"; failed=$((failed+1))
+    elif [[ "$todos" -gt 0 ]]; then status="需人工复核"; need_review=$((need_review+1)); else status="已自动转换"; fi
     printf '| %s | %s | %s |\n' "$base" "$status" "$todos" >>"$report"
     # 默认长度/精度填充 NOTE（架构师 guardrail：不静默）——列出被填 VARCHAR(4000)/DECIMAL(65,30)
     # 的参数/声明，避免掩盖真实长度/精度需求。post-hoc 扫描转换输出。
@@ -68,7 +72,7 @@ run_convert() {
 
   {
     echo
-    echo "**合计**：$total 个过程，其中 $need_review 个需人工复核。"
+    echo "**合计**：$total 个过程，其中 $need_review 个需人工复核、$failed 个转换失败/空输出。"
     echo
     echo "## 默认长度/精度填充 NOTE（不静默）"
     echo
