@@ -59,12 +59,18 @@ _cmp_expand_date() {
   printf '%s' "$out$v"
 }
 
-# 归一化值（按 norm 选项，空格分隔）
+# 归一化值（按 norm 选项，空格分隔）。numeric_scale=N 格式化数字为 N 位小数；其余见 contract。
 _cmp_norm() {
   local v="$1" opts="$2"
   [[ "$opts" == *null_as=NULL* && -z "$v" ]] && v="NULL"
   if [[ "$opts" == *num_str_strip_zeros* ]]; then
     v="$(printf '%s' "$v" | awk '{ n=$0; if(n~/\./){ sub(/0+$/,"",n); sub(/\.$/,"",n) }; print n }')"
+  fi
+  if [[ "$opts" == *numeric_scale=* ]]; then
+    local ns; ns="$(printf '%s' "$opts" | grep -oE 'numeric_scale=[0-9]+' | head -1 | cut -d= -f2)"
+    if [[ -n "$ns" && "$v" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+      v="$(printf '%s' "$v" | awk -v s="$ns" '{ printf "%." s "f", $0 }')"
+    fi
   fi
   if [[ "$opts" == *trim* ]]; then v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"; fi
   if [[ "$opts" == *collapse_ws* ]]; then v="$(printf '%s' "$v" | tr -s '[:space:]' ' ')"; fi
@@ -72,12 +78,26 @@ _cmp_norm() {
   printf '%s' "$v"
 }
 
-# 值级 diff：expected（字面/~正则/<DATE>）vs actual（已归一）。0=匹配 1=不同
+# 把 actual 的日期值按 Oracle fmt 重格式化（date=<field>:<fmt> 归一，field 在 _cmp_diff 判）
+_cmp_norm_date() {
+  local v="$1" fmt="$2" df
+  df="$fmt"; df="${df//YYYY/%Y}"; df="${df//YY/%y}"; df="${df//MM/%m}"; df="${df//DD/%d}"; df="${df//HH24/%H}"; df="${df//MI/%M}"; df="${df//SS/%S}"
+  local parsed; parsed="$(date -d "$v" +"$df" 2>/dev/null || true)"   # date(1) 解析常见日期形态
+  [[ -n "$parsed" ]] && printf '%s' "$parsed" || printf '%s' "$v"
+}
+
+# 值级 diff：expected（字面/~正则/<DATE>）vs actual。opts 含 norm；field 用于 date=<field>:<fmt> 归一。
 _cmp_diff() {
-  local expected="$1" actual="$2" opts="$3"
+  local expected="$1" actual="$2" opts="$3" field="${4:-}"
   expected="$(_cmp_expand_date "$expected")"
   if [[ "$expected" == "~"* ]]; then
     printf '%s' "$actual" | grep -qE "${expected:1}" && return 0 || return 1
+  fi
+  # date=<field>:<fmt> 归一：若此 field 命中，重格式化 actual 的日期值（两端同 fmt）
+  local dfmt=""
+  if [[ -n "$field" && "$opts" == *"date=$field:"* ]]; then
+    dfmt="${opts#*"date=$field:"}"; dfmt="${dfmt%%[ ;]*}"
+    actual="$(_cmp_norm_date "$actual" "$dfmt")"
   fi
   [[ "$(_cmp_norm "$expected" "$opts")" == "$(_cmp_norm "$actual" "$opts")" ]] && return 0 || return 1
 }
@@ -160,7 +180,7 @@ run_exec() {
         for oe in $outexp; do
           exp_name="${oe%%=*}"; exp_val="${oe#*=}"
           local actval; actval="$(printf '%s' "$tout" | awk -v c=$((i+1)) 'NR==2{print $c}')"
-          if ! _cmp_diff "$exp_val" "$actval" "$norm"; then pass="❌ $exp_name: 期望[$exp_val] 实际[$actval]"; break; fi
+          if ! _cmp_diff "$exp_val" "$actval" "$norm" "$exp_name"; then pass="❌ $exp_name: 期望[$exp_val] 实际[$actval]"; break; fi
           i=$((i+1))
         done
       fi
