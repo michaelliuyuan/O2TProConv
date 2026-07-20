@@ -18,7 +18,7 @@
 
 | 顺序 | pass | 职责 |
 |------|------|------|
-| 1 | `_tochar_date` | `TO_CHAR(date,'mask')` → `DATE_FORMAT(date,'%mask')`（须在机械层前，否则 `NOW()` 带括号匹配不到） |
+| 1 | `_tochar_date` | `TO_CHAR(date,'mask')`→`DATE_FORMAT(date,'%mask')` + `TO_DATE(s,'mask')`→`STR_TO_DATE(s,'%mask')`（须在机械层前，否则 `NOW()` 带括号匹配不到） |
 | 2 | `_apply_mechanical` | 确定性 token 替换（类型 / `NVL` / `SYSDATE` / `ELSIF` / 去 Oracle `/` …） |
 | 3 | `_convert_known_semantics` | 忠实语义：`DECODE`→`CASE(<=>)`、`||`→`NULLIF(CONCAT(IFNULL…),'')` |
 | 4 | `_fix_header` | 头部双引号标识符→反引号、去 `owner.` 前缀 |
