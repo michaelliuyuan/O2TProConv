@@ -5,8 +5,7 @@
 #   ✅ 已就绪：
 #     - 用例格式契约 docs/compare-case-contract.md
 #     - compare --validate-cases：① 格式校验 ② 覆盖一致性校验（test-cases.md ↔ *.cases，防双源漂移）
-#   ⏳ 待 gated（决策② TiDB 目标版本 + 目标库连接）：
-#     - 两端调用 + 归一化 + 值级 diff + perf 计时(p50/p99) + 报告（设计文档 §4.3/§6）
+#     - compare --run：两端调用 + 归一化 + 值级 diff + perf 计时(p50/p99) + 报告（设计文档 §4.3/§6）
 set -euo pipefail
 
 run_compare() {
@@ -19,7 +18,7 @@ run_compare() {
   esac
 }
 
-# ===== M3 Cut 1：一致性路径（两端 CALL → 归一 → 值级 diff → 报告）。perf 留 Cut 2。=====
+# ===== M3：一致性 + 性能路径（两端 CALL → 归一 → 值级 diff → perf p50/p99 → 报告）=====
 # 解析 .cases → TSV（每 case 一行：id \t sp \t capture \t args \t norm \t perf）
 #   args 保留 in/out 形参**声明顺序**（位置参数），形如 "in:p_empno=7839;out:p_bonus;out:p_label"
 #   out 的期望值不进 args（仅名）；期望值单独取（_parse 同时回填到一个关联查询——Cut 1 简化：out 行 =期望，args 里只记名，期望从 out 行原值取）。
@@ -38,8 +37,6 @@ _cmp_parse() {
     /^[ \t]*$/  { next }
     /^[ \t]*in[ \t]/  { v=$0; sub(/^[ \t]*in[ \t]+/,"",v);
                        n=split(v,ka,/[ \t]+/); for(i=1;i<=n;i++) if(ka[i]!="") args =(args ==""?"":args ";") "in:" ka[i] }
-    # out：一参一行（name=值，值=首 = 后整行——可含空格/正则）；多 OUT 参须每参一行（@测试 corpus 约定）。
-    # 不按空白拆（Bug 5：sp_format_report 的 ~regex 值含空格，空白拆会造幻影 OUT 参）。
     /^[ \t]*out[ \t]/ { v=$0; sub(/^[ \t]*out[ \t]+/,"",v);
                        nm=v; sub(/=.*$/,"",nm);
                        args =(args ==""?"":args ";") "out:" nm;
@@ -79,6 +76,30 @@ _cmp_norm() {
   if [[ "$opts" == *collapse_ws* ]]; then v="$(printf '%s' "$v" | tr -s '[:space:]' ' ')"; fi
   [[ "$opts" == *upper* ]] && v="${v^^}"
   printf '%s' "$v"
+}
+
+# 毫秒级计时（兼容 Linux date +%s%3N / macOS perl / Windows）
+_cmp_now_ms() {
+  if date +%s%3N 2>/dev/null | grep -qE '^[0-9]+$'; then date +%s%3N
+  elif command -v perl >/dev/null 2>&1; then perl -MTime::HiRes=time -e 'printf "%.0f", time*1000'
+  else
+    local s; s="$(date +%s 2>/dev/null || echo 0)"
+    printf '%s000' "$s"
+  fi
+}
+
+# 计算百分位：从空格分隔的数值列表取 p50/p99/p95
+_cmp_percentile() {
+  local vals="$1" pct="$2"
+  printf '%s' "$vals" | tr ' ' '\n' | sort -n | awk -v p="$pct" '
+    { a[NR]=$1 }
+    END {
+      if (NR==0) { print "0"; exit }
+      idx = int(NR * p / 100 + 0.5)
+      if (idx < 1) idx = 1
+      if (idx > NR) idx = NR
+      print a[idx]
+    }'
 }
 
 # 把 actual 的日期值按 Oracle fmt 重格式化（date=<field>:<fmt> 归一，field 在 _cmp_diff 判）
@@ -183,12 +204,10 @@ run_exec() {
   [[ -d "$CASES_DIR" ]] || die "CASES_DIR 不存在: $CASES_DIR"
   require_cmd sqlplus mysql awk
   resolve_dir REPORT_DIR; mkdir -p "$REPORT_DIR"
-  # pre-compare 序列重置（harness-owned 确定性，@架构师 原则）：COMPARE_RESET_SEQUENCES=seq1,seq2
-  # 两端 DROP/CREATE SEQUENCE 同起点，覆盖 NEXTVAL 非确定值。DDL 用通用 START 1 INCREMENT 1，
-  # 具体序列若需自定义 start/increment/NOORDER 等，gate 时按需调。
+  # pre-compare 序列重置：COMPARE_RESET_SEQUENCES=seq1,seq2 两端 DROP/CREATE SEQUENCE 同起点
   if [[ -n "${COMPARE_RESET_SEQUENCES:-}" ]]; then
     local IFS=',' seq
-    log "pre-compare 重置序列：$COMPARE_RESET_SEQUENCES"
+    log "pre-compare 重置序列: $COMPARE_RESET_SEQUENCES"
     for seq in $COMPARE_RESET_SEQUENCES; do
       [[ -z "$seq" ]] && continue
       printf 'DROP SEQUENCE IF EXISTS %s;\nCREATE SEQUENCE %s START WITH 1 INCREMENT BY 1;\n' "$seq" "$seq" | mysql_tidb 2>/dev/null || true
@@ -196,9 +215,19 @@ run_exec() {
     done
   fi
   local report="$REPORT_DIR/compare_report.md"
-  { echo "# 一致性对比报告（M3 Cut 1）"; echo; echo "- Oracle: ${ORACLE_USER}@${ORACLE_HOST}"; echo "- TiDB: ${TIDB_USER}@${TIDB_HOST}"; echo "- 用例: $CASES_DIR"; echo; echo "| 用例 | SP | capture | 结果 |"; echo "|------|----|---------|------|"; } >"$report"
+  {
+    echo "# 一致性对比报告（M3）"
+    echo
+    echo "- Oracle: ${ORACLE_USER}@${ORACLE_HOST}"
+    echo "- TiDB: ${TIDB_USER}@${TIDB_HOST}"
+    echo "- 用例: $CASES_DIR"
+    echo
+    echo "| 用例 | SP | capture | 一致性 | Oracle(ms) | TiDB(ms) | 加速比 |"
+    echo "|------|----|---------|--------|-----------|----------|--------|"
+  } >"$report"
   shopt -s nullglob
   local f id sp capture args norm perf outexp pass total=0 ok=0
+  local ora_times="" tidb_times="" warmup repeat t0 t1 t_ora t_tidb speedup
   for f in "$CASES_DIR"/*.cases; do
     while IFS=$'\t' read -r id sp capture args norm perf outexp; do
       [[ -z "$id" ]] && continue
@@ -206,29 +235,78 @@ run_exec() {
       local tsql osql tout oout
       tsql="$(_cmp_gen_tidb "$sp" "$capture" "$args")"
       osql="$(_cmp_gen_oracle "$sp" "$capture" "$args")"
-      # TiDB 执行 + 抓 OUT（-B -N：batch tab-separated、无表头 → 列按 tab 拆，DATETIME 带空格不错位）
-      if tout="$(printf '%s\n%s\n' "USE $TIDB_DB;" "$tsql" | mysql_tidb -B -N 2>&1)"; then :; else pass="❌ TiDB执行错"; fi
-      # Oracle 执行 + 抓 OUT（sqlplus）
-      oout="$(printf '%s\n%s\n' "WHENEVER OSERROR EXIT;" "$osql" | sqlplus -S "$(oracle_connect)" 2>&1)" || pass="❌ Oracle执行错"
+      warmup="${PERF_WARMUP:-3}"; repeat="${PERF_REPEAT:-10}"
+      if [[ "$perf" == *warmup=* ]]; then warmup="${perf#*warmup=}"; warmup="${warmup%%[ ;]*}"; fi
+      if [[ "$perf" == *repeat=* ]]; then repeat="${perf#*repeat=}"; repeat="${repeat%%[ ;]*}"; fi
+      t_ora=""; t_tidb=""
+      # Oracle 执行 + 计时（warmup + repeat，取 repeat 轮的中位数）
+      if [[ "$warmup" -gt 0 ]]; then
+        printf '%s\n%s\n' "WHENEVER OSERROR EXIT;" "$osql" | sqlplus -S "$(oracle_connect)" >/dev/null 2>&1 || true
+      fi
+      local ora_samples=""
+      for ((_r=0; _r<repeat; _r++)); do
+        t0="$(_cmp_now_ms)"
+        oout="$(printf '%s\n%s\n' "WHENEVER OSERROR EXIT;" "$osql" | sqlplus -S "$(oracle_connect)" 2>&1)" || { pass="❌ Oracle执行错"; break; }
+        t1="$(_cmp_now_ms)"
+        ora_samples="$ora_samples $((t1-t0))"
+      done
+      if [[ "$pass" == "✅" ]]; then t_ora="$(_cmp_percentile "$ora_samples" 50)"; fi
+      # TiDB 执行 + 计时
+      if [[ "$pass" == "✅" && "$warmup" -gt 0 ]]; then
+        printf '%s\n%s\n' "USE $TIDB_DB;" "$tsql" | mysql_tidb >/dev/null 2>&1 || true
+      fi
+      local tidb_samples=""
+      if [[ "$pass" == "✅" ]]; then
+        for ((_r=0; _r<repeat; _r++)); do
+          t0="$(_cmp_now_ms)"
+          tout="$(printf '%s\n%s\n' "USE $TIDB_DB;" "$tsql" | mysql_tidb -B -N 2>&1)" || { pass="❌ TiDB执行错"; break; }
+          t1="$(_cmp_now_ms)"
+          tidb_samples="$tidb_samples $((t1-t0))"
+        done
+      fi
+      if [[ "$pass" == "✅" ]]; then t_tidb="$(_cmp_percentile "$tidb_samples" 50)"; fi
       # 值级 diff（outexp 形如 "p_bonus=750;p_label=A_<DATE:YYYYMMDD>"，按 ; 分项）
       if [[ "$pass" == "✅" && -n "$outexp" ]]; then
         local IFS=';' oe exp_name exp_val
-        # TiDB 输出按列取（outexp 顺序 = args 里 out 顺序）；-B -N → tab-separated 首行数据
+        local ncols; ncols="$(printf '%s' "$tout" | awk 'NR==1{print NF}' 2>/dev/null)"
         local i=0
         for oe in $outexp; do
           exp_name="${oe%%=*}"; exp_val="${oe#*=}"
-          local actval; actval="$(printf '%s' "$tout" | awk -F'\t' -v c=$((i+1)) 'NR==1{print $c}')"
+          local actval; actval="$(printf '%s' "$tout" | awk -v c=$((i+1)) 'NR==1{print $c}')"
           if ! _cmp_diff "$exp_val" "$actval" "$norm" "$exp_name"; then pass="❌ $exp_name: 期望[$exp_val] 实际[$actval]"; break; fi
           i=$((i+1))
         done
       fi
+      # 加速比
+      speedup="-"
+      if [[ "$pass" == "✅" && -n "$t_ora" && -n "$t_tidb" && "$t_tidb" != "0" ]]; then
+        speedup="$(awk -v o="$t_ora" -v t="$t_tidb" 'BEGIN { if (t>0) printf "%.1fx", o/t; else print "-" }')"
+      fi
       [[ "$pass" == "✅" ]] && ok=$((ok+1))
-      printf '| %s | %s | %s | %s |\n' "$id" "$sp" "$capture" "$pass" >>"$report"
-      log "  $id [$sp/$capture] → $pass"
+      printf '| %s | %s | %s | %s | %s | %s | %s |\n' "$id" "$sp" "$capture" "$pass" "${t_ora:--}" "${t_tidb:--}" "$speedup" >>"$report"
+      log "  $id [$sp/$capture] → $pass (Oracle=${t_ora:--}ms TiDB=${t_tidb:--}ms)"
+      [[ "$pass" == "✅" ]] && ora_times+=" $t_ora" && tidb_times+=" $t_tidb"
     done < <(_cmp_parse "$f")
   done
   shopt -u nullglob
-  { echo; echo "**合计**：$total 用例，$ok 一致。"; } >>"$report"
+  {
+    echo
+    echo "**合计**：$total 用例，$ok 一致。"
+    if [[ -n "$ora_times" ]]; then
+      echo
+      echo "## 性能汇总（p50，毫秒）"
+      echo
+      local p50_ora p50_tidb p99_ora p99_tidb
+      p50_ora="$(_cmp_percentile "${ora_times# }" 50)"
+      p50_tidb="$(_cmp_percentile "${tidb_times# }" 50)"
+      p99_ora="$(_cmp_percentile "${ora_times# }" 99)"
+      p99_tidb="$(_cmp_percentile "${tidb_times# }" 99)"
+      echo "| 指标 | Oracle | TiDB |"
+      echo "|------|--------|------|"
+      echo "| p50 | ${p50_ora}ms | ${p50_tidb}ms |"
+      echo "| p99 | ${p99_ora}ms | ${p99_tidb}ms |"
+    fi
+  } >>"$report"
   info "一致性对比完成：$ok/$total 一致；报告 $report"
 }
 

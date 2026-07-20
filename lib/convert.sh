@@ -29,10 +29,44 @@ run_convert() {
 
   shopt -s nullglob
   local f base out todos status total=0 need_review=0 failed=0
-  local note_section="" sem_section=""
+  local note_section="" sem_section="" tmpdir
+  tmpdir="$(mktemp -d)"
   for f in "$ORACLE_DIR"/*.sql; do
     [[ "$(basename "$f")" == _* ]] && continue      # 跳过 _proc_list.tsv 等辅助文件
     base="$(basename "$f" .sql)"
+
+    # PACKAGE BODY 拆分：一个 PACKAGE_BODY 含多个 PROCEDURE/FUNCTION → 拆为独立文件分别转换
+    if grep -qiE 'CREATE[[:space:]]+OR[[:space:]]+REPLACE[[:space:]]+PACKAGE[[:space:]]+BODY' "$f" 2>/dev/null; then
+      local pkg_sp_list; pkg_sp_list="$(_split_package_body "$f" "$tmpdir" "$base")"
+      if [[ -n "$pkg_sp_list" ]]; then
+        local pkg_sp pkg_base pkg_out pkg_todos
+        for pkg_sp in $pkg_sp_list; do
+          pkg_base="$(basename "$pkg_sp" .sql)"
+          pkg_out="$CONVERTED_DIR/${pkg_base}.tidb.sql"
+          convert_one "$pkg_sp" "$pkg_out"
+          pkg_todos=$(grep -c '^-- TODO(' "$pkg_out" || true)
+          total=$((total+1))
+          if ! grep -qE '^CREATE[[:space:]]+(PROCEDURE|FUNCTION)' "$pkg_out"; then
+            printf '| %s | %s | %s |\n' "$pkg_base" "⚠️ 转换失败/空输出（头部 parse 不了？）需人工" "0" >>"$report"; failed=$((failed+1))
+          elif [[ "$pkg_todos" -gt 0 ]]; then
+            printf '| %s | %s | %s |\n' "$pkg_base" "需人工复核" "$pkg_todos" >>"$report"; need_review=$((need_review+1))
+          else
+            printf '| %s | %s | %s |\n' "$pkg_base" "已自动转换" "0" >>"$report"
+          fi
+          log "  $pkg_base → $pkg_out（TODO: $pkg_todos）"
+        done
+      else
+        # PACKAGE BODY 拆分失败 → 原样转换（产出 defensive check 失败）
+        out="$CONVERTED_DIR/${base}.tidb.sql"
+        convert_one "$f" "$out"
+        todos=$(grep -c '^-- TODO(' "$out" || true)
+        total=$((total+1)); failed=$((failed+1))
+        printf '| %s | %s | %s |\n' "$base" "⚠️ PACKAGE BODY 拆分失败，需人工" "$todos" >>"$report"
+        log "  $base → $out（PACKAGE BODY 拆分失败）"
+      fi
+      continue
+    fi
+
     out="$CONVERTED_DIR/${base}.tidb.sql"
     convert_one "$f" "$out"
     todos=$(grep -c '^-- TODO(' "$out" || true)
@@ -69,6 +103,7 @@ run_convert() {
     log "  $base → $out（TODO: $todos）"
   done
   shopt -u nullglob
+  rm -rf "$tmpdir"
 
   {
     echo
@@ -101,6 +136,47 @@ run_convert() {
   info "转换完成：$total 个，需复核 $need_review 个；报告 $report"
 }
 
+# PACKAGE BODY 拆分：从 Oracle PACKAGE BODY 中提取独立的 PROCEDURE/FUNCTION 定义，
+# 写入临时文件供后续 convert_one 逐个转换。返回空格分隔的临时文件路径列表。
+# 注意：PACKAGE 级变量/类型/游标声明不随子程序迁移，需人工处理（标记 TODO）。
+_split_package_body() {
+  local pkg_file="$1" tmpdir="$2" prefix="$3"
+  local sp_list=""
+  awk -v tmpdir="$tmpdir" -v prefix="$prefix" '
+    BEGIN { IGNORECASE=1; in_sp=0; sp_name=""; sp_type=""; sp_lines=0; sp_count=0 }
+    /^[ \t]*--/ { if (in_sp) sp_buf[sp_lines++] = $0; next }
+    /^[ \t]*PROCEDURE[ \t]+[A-Za-z_][A-Za-z0-9_]*/ || /^[ \t]*FUNCTION[ \t]+[A-Za-z_][A-Za-z0-9_]*/ {
+      if (in_sp) { flush_sp() }
+      in_sp=1; sp_lines=0
+      if ($0 ~ /^[ \t]*PROCEDURE/) sp_type="PROCEDURE"
+      else sp_type="FUNCTION"
+      sp_name=$0; sub(/^[ \t]*(PROCEDURE|FUNCTION)[ \t]+/,"",sp_name); sub(/[ \t(;].*$/,"",sp_name)
+      sp_buf[sp_lines++] = "CREATE OR REPLACE " sp_type " " sp_name
+      rest=$0; sub(/^[ \t]*(PROCEDURE|FUNCTION)[ \t]+[A-Za-z_][A-Za-z0-9_]*/,"",rest)
+      if (rest !~ /^[ \t]*$/) sp_buf[sp_lines-1] = sp_buf[sp_lines-1] rest
+      next
+    }
+    {
+      if (in_sp) sp_buf[sp_lines++] = $0
+      # 检测子程序结束：END 后跟过程名或分号（非 END IF/LOOP/CASE）
+      if (in_sp && $0 ~ /^[ \t]*END[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*;/) {
+        flush_sp()
+      }
+    }
+    function flush_sp(   fname, i) {
+      if (!in_sp || sp_lines == 0) return
+      fname = tmpdir "/" prefix "_" sp_name ".sql"
+      for (i=0; i<sp_lines; i++) print sp_buf[i] > fname
+      close(fname)
+      printf "%s ", fname
+      sp_count++
+      in_sp=0; sp_lines=0
+    }
+    END { if (in_sp) flush_sp() }
+  ' "$pkg_file"
+  printf '%s' "$sp_list"
+}
+
 # 转换单个文件
 convert_one() {
   local in="$1" out="$2"
@@ -112,6 +188,7 @@ convert_one() {
   text="$(_mark_complex   <<<"$text")"
   text="$(_rewrite_header <<<"$text")"
   text="$(_param_mode     <<<"$text")"
+  text="$(_nested_blocks  <<<"$text")"
   text="$(_restructure    <<<"$text")"
   text="$(_convert_type_aware <<<"$text")"
   {
@@ -631,6 +708,62 @@ _param_mode() {
       depth += (no - nc)
       if (active && !closed && depth<=0 && (no>0||nc>0)) closed=1
       print
+    }
+  '
+}
+
+# 嵌套 DECLARE..BEGIN..END 块转换（Oracle 嵌套块 → MySQL 嵌套 BEGIN..END）。
+# Oracle 允许在过程体内嵌套 DECLARE..BEGIN..END；MySQL 仅支持嵌套 BEGIN..END（无 DECLARE 关键字）。
+# 处理：
+#   - 嵌套 DECLARE → 移除，声明直接进入 BEGIN 内
+#   - 嵌套 EXCEPTION → 标 TODO（需人工转为 DECLARE EXIT HANDLER）
+#   - 简单嵌套块（无 EXCEPTION）→ 直接转 BEGIN..END
+# 未处理：嵌套块内自定义 CONDITION / RAISE_APPLICATION_ERROR / 多层嵌套 → 标 TODO。
+_nested_blocks() {
+  awk '
+    BEGIN { IGNORECASE=1; body_started=0; in_nested=0; nested_lines=0; nested_exc=0; nested_depth=0 }
+    function is_top_begin(line) { return line ~ /^[ \t]*BEGIN[ \t]*$/ }
+    function is_nested_declare(line) { return body_started && !in_nested && line ~ /^[ \t]*DECLARE[ \t]*$/ }
+    function is_nested_end(line) {
+      if (!in_nested) return 0
+      if (line ~ /^[ \t]*END[ \t]*;?[ \t]*$/ && line !~ /END[ \t]+(IF|LOOP|CASE|FOR|REPEAT|WHILE)/) return 1
+      return 0
+    }
+    {
+      line = $0
+      if (line ~ /^[ \t]*--/) { if (in_nested) nested[nested_lines++] = line; else print line; next }
+      if (is_top_begin(line)) { body_started = 1; print line; next }
+      if (!body_started) { print line; next }
+      if (is_nested_declare(line)) {
+        in_nested = 1; nested_lines = 0; nested_exc = 0; nested_depth = 0; next
+      }
+      if (in_nested) {
+        nested[nested_lines++] = line
+        if (line ~ /^[ \t]*EXCEPTION[ \t]*$/) nested_exc = 1
+        if (line ~ /^[ \t]*BEGIN[ \t]*$/) {
+          nested_depth++
+          if (nested_depth > 1) nested[nested_lines-1] = "-- TODO(需人工转换): 多层嵌套 DECLARE..BEGIN..END 需人工展开"
+        }
+        if (is_nested_end(line) && nested_depth == 0) {
+          in_nested = 0
+          if (nested_exc) {
+            print "-- TODO(需人工转换): 嵌套块含 EXCEPTION，需人工转为 DECLARE EXIT HANDLER"
+            for (i=0; i<nested_lines; i++) print nested[i]
+          } else {
+            print "    BEGIN"
+            for (i=0; i<nested_lines; i++) {
+              l = nested[i]
+              if (l ~ /^[ \t]*BEGIN[ \t]*$/) continue
+              if (l ~ /^[ \t]*END[ \t]*;?[ \t]*$/) continue
+              print l
+            }
+            print "    END;"
+          }
+        }
+        if (line ~ /^[ \t]*END[ \t]*;?[ \t]*$/ && line !~ /END[ \t]+(IF|LOOP|CASE|FOR|REPEAT|WHILE)/) nested_depth--
+        next
+      }
+      print line
     }
   '
 }

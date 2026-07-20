@@ -1,58 +1,7 @@
 # oracle2tidb-sp
 
 基于 **纯 shell** 的 Oracle 存储过程 → TiDB（MySQL 兼容）转换与对比工具。
-
-> 设计文档（模块设计 / 规则映射表 / 转换置信度报告 / 对比契约 / 风险）已嵌入本文档各章节，不再单独维护外部文件。
-
-## 快速开始
-
-```bash
-# 1. 克隆仓库
-git clone https://github.com/michaelliuyuan/O2TProConv.git
-cd O2TProConv
-
-# 2. 配置连接
-cp ora2tidb.conf.example ora2tidb.conf
-# 编辑 ora2tidb.conf 填入 Oracle 和 TiDB 连接信息
-
-# 3. 能力探针（验证 TiDB 支持）
-./bin/ora2tidb capability -c ora2tidb.conf
-
-# 4. 一键导出 + 转换
-./bin/ora2tidb all -c ora2tidb.conf
-
-# 5. 部署到 TiDB 并对比
-# 详见下方「使用示例」章节
-```
-
-## 环境要求
-
-| 组件 | 版本/要求 | 用途 |
-|------|----------|------|
-| bash | ≥ 4.0 | 脚本运行环境 |
-| Oracle 客户端 | sqlplus 或 sqlcl | 导出 SP 定义 + 对比执行 |
-| TiDB 客户端 | mysql (MySQL 协议兼容) | 部署 SP + 对比执行 |
-| GNU sed | 任意版本 | 文本转换 |
-| GNU awk (gawk) | 任意版本 | 文本处理 |
-| bc | 可选 | 性能统计数值计算 |
-| jq | 可选 | JSON 处理 |
-
-**已验证环境**：Oracle 23ai Free + TiDB v7.1.9。
-
-## 安装
-
-```bash
-# 克隆仓库到本地
-git clone https://github.com/michaelliuyuan/O2TProConv.git
-cd O2TProConv
-
-# 确保脚本可执行
-chmod +x bin/ora2tidb capability-check/run_capability_check.sh
-
-# 验证依赖
-bash --version | head -1          # 确认 bash ≥ 4
-command -v sqlplus mysql sed awk  # 确认客户端和工具可用
-```
+对齐架构设计文档 `oracle-sp-to-tidb-sp-design.md`（模块设计 / 规则映射表 / 转换置信度报告 / 对比契约 / 风险）。
 
 ## 能力（设计文档 §1）
 
@@ -88,8 +37,6 @@ command -v sqlplus mysql sed awk  # 确认客户端和工具可用
 ## 依赖
 
 bash ≥ 4；Oracle 侧 `sqlplus`/`sqlcl`；TiDB 侧 `mysql`；GNU `sed`/`gawk`；可选 `bc`/`jq`。
-
-> 详见上方「环境要求」和「安装」章节。
 
 ## 目录结构
 
@@ -345,8 +292,8 @@ DELIMITER ;
 ## 里程碑（设计文档 §7）
 
 - **M1** export 模块 + TiDB SP 能力验证 — ✅ 代码就绪 + 能力探针实跑通过（TiDB v7.1.9，含 GET DIAGNOSTICS 实证）
-- **M2** convert 规则引擎 + 转换置信度报告 — ✅ 机械规则 + **结构层**（EXCEPTION→EXIT handler / 显式游标 / WHILE→DO / 数值 FOR→WHILE+计数器 / CONTINUE→ITERATE / `:=`→SET / DECLARE 序重排 / END 规范 / 嵌套 DECLARE..BEGIN..END）+ 忠实 `||`/`DECODE`(`<=>`) + `TO_CHAR(date)`→`DATE_FORMAT` + 报告（含默认长度 NOTE）；**T1+T2 验收通过（8/8 CREATE + golden + 一致性）**；T3 族 deferred（标 TODO）
-- **M3** compare harness — ✅ 用例契约 + `--validate-cases` 离线校验 + Cut 1 一致性路径（两端 CALL→归一→值级 diff→报告）已合入（`df84a4b`）
+- **M2** convert 规则引擎 + 转换置信度报告 — ✅ 机械规则 + **结构层**（EXCEPTION→EXIT handler / 显式游标 / WHILE→DO / 数值 FOR→WHILE+计数器 / CONTINUE→ITERATE / `:=`→SET / DECLARE 序重排 / END 规范）+ 忠实 `||`/`DECODE`(`<=>`) + `TO_CHAR(date)`→`DATE_FORMAT` + 报告（含默认长度 NOTE）；**T1+T2 验收通过（8/8 CREATE + golden + 一致性）**；DATE→DATETIME / 嵌套块 / T3 族 deferred（标 TODO）
+- **M3** compare harness — ✅ 用例契约 + `--validate-cases` 离线校验 + `--run` 执行对比（CALL/归一/diff/perf p50/p99/报告）
 - **M4** 一键 `all` + 加固
 
 ## 转换覆盖（诚实边界，详见设计文档 §5）
@@ -356,55 +303,25 @@ DELIMITER ;
 - 内置：`NVL→IFNULL`、`SYSDATE→NOW()`、`SYSTIMESTAMP→CURRENT_TIMESTAMP(6)`、`TO_CHAR(date,'mask')→DATE_FORMAT`、`TO_DATE(str,'mask')→STR_TO_DATE`、`LENGTH→CHAR_LENGTH`、`CHR→CHAR`、`SYS_GUID()→UUID()`⚠️、`NVL2(a,b,c)→IF(a IS NOT NULL,b,c)`⚠️、`ADD_MONTHS(d,n)→DATE_ADD(d,INTERVAL n MONTH)`、`MONTHS_BETWEEN(a,b)→TIMESTAMPDIFF(MONTH,b,a)`⚠️参数反转、`ELSIF→ELSEIF`
 - 忠实语义：`a||b→NULLIF(CONCAT(IFNULL(a,''),IFNULL(b,'')),'')`（简单链，NULL 安全）、`DECODE(e,s1,r1,..,def)→CASE WHEN e<=>s1 THEN r1 .. ELSE def END`（`<=>` null-safe）
 - ⚠️ **语义差异 NOTE**（已转但有已知差，转换报告「语义差异 NOTE」段列出，需核对）：`SYS_GUID()→UUID()`（Oracle 32-hex 无连字符 vs MySQL 36 带连字符）、`MONTHS_BETWEEN→TIMESTAMPDIFF`（Oracle 小数月 vs MySQL 整数月截断）、`NVL2→IF`（Oracle `''≡NULL` vs MySQL `''≠NULL`，空串路径分歧）。
-- 结构：EXCEPTION 块→`EXIT HANDLER`（NO_DATA_FOUND→`FOR NOT FOUND`、OTHERS→`FOR SQLEXCEPTION`+`GET DIAGNOSTICS`+`SQLERRM→v_errmsg`）；显式游标 `CURSOR c IS`→`DECLARE c CURSOR FOR`（+done 标志 + `CONTINUE HANDLER FOR NOT FOUND` + label + `EXIT WHEN c%NOTFOUND`→`IF done=1 THEN LEAVE`）；`WHILE..LOOP`→`WHILE..DO`；数值 `FOR v IN lo..hi LOOP`→`WHILE v<=hi DO`（+计数器递增）；`CONTINUE`→`ITERATE label`（FOR 内前置递增防死循环）；`:=`→`SET`/`DEFAULT`；DECLARE 序重排（变量/条件→游标→handler）；头部 `CREATE OR REPLACE`→`DROP IF EXISTS`+`CREATE`、双引号→反引号、去 owner 前缀、`RETURN<type>→RETURNS<type>`；去 Oracle `/` 终止行；`DELIMITER //` 包裹；嵌套 `DECLARE..BEGIN..END`→`BEGIN DECLARE <decls> <body> END`（block_depth 跟踪，嵌套 EXCEPTION 标 TODO）。
+- 结构：EXCEPTION 块→`EXIT HANDLER`（NO_DATA_FOUND→`FOR NOT FOUND`、OTHERS→`FOR SQLEXCEPTION`+`GET DIAGNOSTICS`+`SQLERRM→v_errmsg`）；显式游标 `CURSOR c IS`→`DECLARE c CURSOR FOR`（+done 标志 + `CONTINUE HANDLER FOR NOT FOUND` + label + `EXIT WHEN c%NOTFOUND`→`IF done=1 THEN LEAVE`）；`WHILE..LOOP`→`WHILE..DO`；数值 `FOR v IN lo..hi LOOP`→`WHILE v<=hi DO`（+计数器递增）；`CONTINUE`→`ITERATE label`（FOR 内前置递增防死循环）；`:=`→`SET`/`DEFAULT`；DECLARE 序重排（变量/条件→游标→handler）；头部 `CREATE OR REPLACE`→`DROP IF EXISTS`+`CREATE`、双引号→反引号、去 owner 前缀、`RETURN<type>→RETURNS<type>`；去 Oracle `/` 终止行；`DELIMITER //` 包裹；嵌套 `DECLARE..BEGIN..END`（简单块→MySQL `BEGIN..END`，含 EXCEPTION 的标 TODO）。
 
-**自动标记 `-- TODO(需人工转换)`**：跨表达式/跨行 `||`（**Route A 下留字面交 PIPES_AS_CONCAT**，TODO 标部署要求——见 Usage Step 5）、`%TYPE/%ROWTYPE`、`EXECUTE IMMEDIATE`、`BULK COLLECT/FORALL`、`TO_CHAR(number/复杂)`、`DBMS_OUTPUT`、游标/REVERSE `FOR..IN`、`GOTO`（MySQL 不支持）。
+**自动标记 `-- TODO(需人工转换)`**：跨表达式/跨行 `||`（**Route A 下留字面交 PIPES_AS_CONCAT**，TODO 标部署要求——见 Usage Step 5）、`%TYPE/%ROWTYPE`、`EXECUTE IMMEDIATE`、`BULK COLLECT/FORALL`、`TO_CHAR(number/复杂)`、`DBMS_OUTPUT`、游标/REVERSE `FOR..IN`、`GOTO`（MySQL 不支持）、嵌套 `DECLARE..BEGIN..END`（含 EXCEPTION 的复杂嵌套块）。
 
-**⚠️ DECLARE 顺序**（@测试工程师 抓的坑，已纳入）：转换器生成声明时按 **变量/条件 → 游标 → handler（handler 最后）**，capability 探针 `02_declare_order.sql` 实证。
+**PACKAGE BODY 拆分**：Oracle PACKAGE BODY 含多个 PROCEDURE/FUNCTION → 自动提取为独立 `.sql` 文件分别转换。PACKAGE 级变量/类型/游标声明不随子程序迁移，需人工处理。PACKAGE spec（仅声明）暂不支持。
 
-**覆盖率**：T1+T2 常见 SP 定义 8/8 全自动转换（corpus 实测 CREATE + golden + 一致性通过）；复杂 T3（`%ROWTYPE` / BULK COLLECT / 动态 SQL / 集合 / 游标 FOR）标 `-- TODO` 走人工；**PACKAGE（spec+body 头部 parse 不了）输出空 → defensive check 标「⚠️ 转换失败/需人工」**（非「已自动转换」假象；Phase 2/T3 支持）。**诚实边界**：纯正则无法区分字符串字面量与代码、无法处理嵌套，强行转换比「提示人工」更坏——不可靠处留 `-- TODO`，parse 不了的头部标失败，均不臆造。
+**覆盖率**：T1+T2 常见 SP 定义 8/8 全自动转换（corpus 实测 CREATE + golden + 一致性通过）；复杂 T3（`%ROWTYPE` / BULK COLLECT / 动态 SQL / 集合 / 游标 FOR）标 `-- TODO` 走人工；PACKAGE BODY 自动拆分+转换。**诚实边界**：纯正则无法区分字符串字面量与代码、无法处理嵌套，强行转换比「提示人工」更坏——不可靠处留 `-- TODO`，均不臆造。
 
 ## 进度
 
 - [x] 仓库骨架 + `ora2tidb` 入口 + 配置（对齐设计文档）
 - [x] 模块1 export（sqlplus + `DBMS_METADATA.GET_DDL`）
-- [x] 模块2 convert（机械规则 + **结构层**：EXCEPTION→EXIT handler / 显式游标 / WHILE→DO / 数值 FOR / CONTINUE / `:=`→SET / DECLARE 序重排 / 嵌套 DECLARE..BEGIN..END + 忠实 `||`/`DECODE`(`<=>`) + GOTO 标记 + 报告含默认长度 NOTE）
+- [x] 模块2 convert（机械规则 + **结构层**：EXCEPTION→EXIT handler / 显式游标 / WHILE→DO / 数值 FOR / CONTINUE / `:=`→SET / DECLARE 序重排 + 忠实 `||`/`DECODE`(`<=>`) + 报告含默认长度 NOTE）
 - [x] M1 能力探针 6 个 + 运行器，**实跑通过**（TiDB v7.1.9，含 GET DIAGNOSTICS 实证）
 - [x] compare 用例格式契约 + `--validate-cases` 离线校验
 - [x] **T1+T2 验收**：8/8 CREATE + golden diff + 一致性通过（1/7→8/8）
 - [x] Route A 部署方案（global `PIPES_AS_CONCAT` + SP 创建时锁定，见 Usage Step 5）
-- [x] M3 compare 执行对比（调用/归一/diff/perf/报告）— ✅ Cut 1 一致性路径就绪，代码已合入（`df84a4b`）
-- [x] DATE→DATETIME 类型转换 — ✅ 已纳入 `_apply_mechanical`（`a7eb97d`），保 Oracle DATE 时分秒
-- [x] 嵌套 DECLARE..BEGIN..END — ✅ 自动转换（Oracle `DECLARE <decls> BEGIN`→MySQL `BEGIN DECLARE <decls>`，嵌套 EXCEPTION 标 TODO）
-- [x] GOTO→unsupported TODO — ✅ `_mark_complex` 检测 `GOTO` 语句和 `<<label>>` 标签，注入 TODO
-- [ ] deferred：T3 族（PACKAGE·%ROWTYPE·BULK COLLECT·动态 SQL·集合·游标 FOR）
-
-## 常见问题
-
-### Q: 转换后 TiDB CREATE 报 1064 语法错误？
-
-检查 `||` 拼接问题。MySQL/TiDB 默认 `||` 是逻辑或，需设置 `PIPES_AS_CONCAT`（见使用示例 Step 5）。含 NULL 的 `||` 已由转换器自动处理为 `NULLIF(CONCAT(IFNULL(...)),'')`。
-
-### Q: `:=` 赋值报语法错误？
-
-TiDB 不支持裸 `:=` 赋值，转换器会自动将执行段 `:=` 转为 `SET ... = ...`，声明段转为 `DEFAULT`。若仍有报错，检查是否漏转。
-
-### Q: Oracle 连接报 ORA-12154？
-
-检查 `ora2tidb.conf` 中 `ORACLE_HOST`、`ORACLE_PORT`、`ORACLE_SERVICE` 是否正确。确认 `tnsping` 可达。
-
-### Q: 口令含特殊字符（`/` `@` `#`）怎么办？
-
-`oracle_connect()` 使用 `user/pass@//host:port/service` 格式，特殊字符可能导致解析失败。建议使用 Oracle Wallet 或对特殊字符进行 URL 编码。
-
-### Q: 转换出的 SP 含 `-- TODO` 标记怎么办？
-
-`-- TODO` 表示转换器无法可靠自动转换该处（如 `%ROWTYPE`、`EXECUTE IMMEDIATE`、`BULK COLLECT`、跨行 `||` 等），需人工介入。详见「转换覆盖」章节的诚实边界策略。
-
-### Q: 嵌套 DECLARE..BEGIN..END 能自动转换吗？
-
-能。Oracle 嵌套块 `DECLARE <decls> BEGIN <body> END` 会自动转为 MySQL `BEGIN DECLARE <decls> <body> END`。嵌套块内的 `:=` 转为 `DEFAULT`。嵌套 EXCEPTION 暂标 TODO，需人工处理。
-
-### Q: 性能对比结果 TiDB 比 Oracle 慢很多？
-
-Oracle PL/SQL 原生循环调用接近 0 开销，TiDB 每次 `CALL` 约 3.5ms 调度开销。SP-heavy OLTP 场景迁移需评估此差异。建议使用 `PERF_WARMUP`（预热）和 `PERF_REPEAT`（重复次数）获取稳定数据。
+- [x] M3 compare 执行对比（两端调用/归一/diff/perf 计时 p50/p99/报告）
+- [x] DATE→DATETIME 类型转换（`_apply_mechanical` 内 `\bDATE\b→DATETIME`，日期字面量保留 `DATE '...'`）
+- [x] 嵌套 DECLARE..BEGIN..END 转换（简单嵌套块→MySQL `BEGIN..END`；含 EXCEPTION 的标 TODO）
+- [x] PACKAGE BODY 拆分（自动提取内部 PROCEDURE/FUNCTION 为独立文件分别转换）
+- [ ] deferred：T3 族（%ROWTYPE·BULK COLLECT·动态 SQL·集合·游标 FOR 自动转换）、GOTO→unsupported TODO
