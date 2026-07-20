@@ -324,9 +324,9 @@ _mark_complex() {
       if ($0 ~ /BULK[ \t]+COLLECT|FORALL/)       todo("批量操作 BULK COLLECT/FORALL 无直接对应，需改写为游标循环")
       if ($0 ~ /TO_CHAR[ \t]*\(/)                todo("TO_CHAR(number 或复杂参数) 无干净 MySQL 对应，需人工（DATE 形态已自动转 DATE_FORMAT）")
       if ($0 ~ /DBMS_OUTPUT/)                    todo("DBMS_OUTPUT 需改 SELECT 结果 / 写日志表")
-      # 注：EXCEPTION 块（WHEN NO_DATA_FOUND/OTHERS）与显式游标 CURSOR..IS 现由 _restructure 自动转换
-      # （EXIT handler 提升 / DECLARE..CURSOR FOR + done 标志），此处不再标 TODO，避免残留假阳性。
-      if ($0 ~ /[ \t]FOR[ \t]+.*[ \t]IN[ \t]+/)  todo("FOR..IN 循环：数值范围可转 WHILE，游标循环需改写，无法自动判定")
+      # 注：EXCEPTION 块（WHEN NO_DATA_FOUND/OTHERS）/ 显式游标 CURSOR..IS / 数值 FOR..IN 现由 _restructure
+      # 自动转换（EXIT handler / DECLARE..CURSOR FOR + done / WHILE+计数器）；游标/REVERSE FOR 在 _restructure
+      # 内单独标 TODO。此处不再标 FOR/EXCEPTION/CURSOR，避免残留假阳性。
       print
     }
   '
@@ -426,10 +426,21 @@ _restructure() {
       return gensub(/^([ \t]*)([A-Za-z_][A-Za-z0-9_.]*)[ \t]*:=[ \t]*/, "\\1SET \\2 = ", "g", line)
     }
     # 组装：header(DROP+CREATE+params) → BEGIN → 变量(+done/v_errmsg) → 游标 → handler → body → END
-    function assemble(    h) {
+    function assemble(    h, vn, vl, i, vline, vname) {
       printf "%s", hdrbuf
       print "BEGIN"
-      if (varbuf != "")  printf "%s\n", varbuf
+      if (varbuf != "") {
+        vn=split(varbuf, vl, "\n")
+        for(i=1;i<=vn;i++){
+          vline=vl[i]
+          # 若声明的是数值 FOR 计数器变量 → 改 INT DEFAULT <lo>（计数器为整数、初值=FOR 下界）
+          if (vline ~ /^DECLARE[ \t]+[A-Za-z_][A-Za-z0-9_]*/) {
+            vname=vline; sub(/^DECLARE[ \t]+/,"",vname); sub(/[ \t].*$/,"",vname)
+            if (vname in for_lo) vline="DECLARE " vname " INT DEFAULT " for_lo[vname] ";"
+          }
+          print vline
+        }
+      }
       if (done_needed)   print "    DECLARE done INT DEFAULT 0;"
       if (has_others)    print "    DECLARE v_errmsg VARCHAR(255);"
       if (curbuf != "")  printf "%s\n", curbuf
@@ -480,10 +491,30 @@ _restructure() {
       }
       # state == body
       if (line ~ /^[ \t]*EXCEPTION[ \t]*$/) { state="exception"; exc_curr=""; next }
-      if (line ~ /^[ \t]*END[ \t]+LOOP/) {                                     # END LOOP → END WHILE(若栈顶 WHILE) / END LOOP
-        if (ltop>0) { if (ltype[ltop]=="WHILE") { l=line; sub(/LOOP/, "WHILE", l); bodybuf=bodybuf l "\n" } else bodybuf=bodybuf line "\n"; ltop-- }
-        else bodybuf=bodybuf line "\n"
+      if (line ~ /^[ \t]*END[ \t]+LOOP/) {                                     # END LOOP：FOR→SET 计数器+1 + END WHILE label；WHILE→END WHILE；LOOP→保留
+        ind=getindent(line)
+        if (ltop>0) {
+          if (ltype[ltop]=="FOR")      bodybuf=bodybuf ind "    SET " lvar[ltop] " = " lvar[ltop] " + 1;\n" ind "END WHILE " llabel[ltop] ";\n"
+          else if (ltype[ltop]=="WHILE") { l=line; sub(/LOOP/, "WHILE", l); bodybuf=bodybuf l "\n" }
+          else                          bodybuf=bodybuf line "\n"
+          ltop--
+        } else bodybuf=bodybuf line "\n"
         next
+      }
+      if (line ~ /^[ \t]*FOR[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IN[ \t]+[0-9]+[ \t]*\.\.[ \t]*[^ \t]+[ \t]+LOOP[ \t]*$/) {
+        # 数值 FOR v IN lo..hi LOOP → lbl: WHILE v <= hi DO（计数器 v 在 assemble 改 INT DEFAULT lo；
+        # 循环末尾 END LOOP 注入 SET v=v+1——MySQL WHILE 无 FOR 自动递增）。REVERSE 未覆盖（落 cursor-FOR TODO）。
+        ind=getindent(line); core=substr(line,length(ind)+1)
+        sub(/^FOR[ \t]+/,"",core); fvar=core; sub(/[ \t]+IN.*$/,"",fvar)
+        sub(/^[A-Za-z_][A-Za-z0-9_]*[ \t]+IN[ \t]+/,"",core)                  # core = "lo..hi LOOP"
+        dd=index(core,".."); lo=substr(core,1,dd-1); gsub(/[ \t]+$/,"",lo)
+        hi=substr(core,dd+2); sub(/^[ \t]+/,"",hi); sub(/[ \t]+LOOP[ \t]*$/,"",hi)
+        for_lo[fvar]=lo
+        lbl=newlabel(); ltop++; ltype[ltop]="FOR"; llabel[ltop]=lbl; lvar[ltop]=fvar; llo[ltop]=lo
+        bodybuf=bodybuf ind lbl ": WHILE " fvar " <= " hi " DO\n"; next
+      }
+      if (line ~ /^[ \t]*FOR[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IN[ \t]+/) {       # 游标 FOR / REVERSE FOR（无数值 .. 范围）→ TODO
+        bodybuf=bodybuf line "\t-- TODO(需人工转换): 游标/REVERSE FOR..IN 需改 DECLARE CURSOR+LOOP/FETCH 或反向计数\n"; next
       }
       if (line ~ /^[ \t]*WHILE[ \t].*[ \t]LOOP[ \t]*$/) {                      # WHILE c LOOP → label: WHILE c DO
         lbl=newlabel(); ltop++; ltype[ltop]="WHILE"; llabel[ltop]=lbl
@@ -494,13 +525,25 @@ _restructure() {
         lbl=newlabel(); ltop++; ltype[ltop]="LOOP"; llabel[ltop]=lbl
         ind=getindent(line); bodybuf=bodybuf ind lbl ": LOOP\n"; next
       }
+      if (line ~ /^[ \t]*CONTINUE[ \t]*;/) {                                   # CONTINUE; → ITERATE label（FOR 内先递增计数器防死循环；允许行尾 -- 注释）
+        ind=getindent(line); lbl=(ltop>0?llabel[ltop]:"lp1")
+        if (ltop>0 && ltype[ltop]=="FOR") bodybuf=bodybuf ind "SET " lvar[ltop] " = " lvar[ltop] " + 1;\n"
+        bodybuf=bodybuf ind "ITERATE " lbl ";\n"; next
+      }
+      if (line ~ /^[ \t]*CONTINUE[ \t]+WHEN[ \t]+/) {                         # CONTINUE WHEN cond → IF cond THEN (SET+1)? ITERATE
+        ind=getindent(line); core=line; sub(/^[ \t]*CONTINUE[ \t]+WHEN[ \t]+/,"",core); sub(/;[ \t]*$/,"",core)
+        lbl=(ltop>0?llabel[ltop]:"lp1")
+        bodybuf=bodybuf ind "IF " core " THEN\n"
+        if (ltop>0 && ltype[ltop]=="FOR") bodybuf=bodybuf ind "    SET " lvar[ltop] " = " lvar[ltop] " + 1;\n"
+        bodybuf=bodybuf ind "    ITERATE " lbl ";\n" ind "END IF;\n"; next
+      }
       if (line ~ /^[ \t]*EXIT[ \t]+WHEN[ \t]+/) {                              # EXIT WHEN c%NOTFOUND → IF done=1 THEN LEAVE
         ind=getindent(line); core=line; sub(/^[ \t]*EXIT[ \t]+WHEN[ \t]+/,"",core); sub(/;[ \t]*$/,"",core)
         cond = (core ~ /[A-Za-z_][A-Za-z0-9_]*%NOTFOUND/ ? "done = 1" : core)
         lbl=(ltop>0?llabel[ltop]:"lp1")
         bodybuf=bodybuf ind "IF " cond " THEN\n" ind "    LEAVE " lbl ";\n" ind "END IF;\n"; next
       }
-      if (line ~ /^[ \t]*EXIT[ \t]*;?[ \t]*$/) {                               # 裸 EXIT → LEAVE label
+      if (line ~ /^[ \t]*EXIT[ \t]*;/) {                                       # 裸 EXIT; → LEAVE label（允许行尾 -- 注释）
         ind=getindent(line); lbl=(ltop>0?llabel[ltop]:"lp1")
         bodybuf=bodybuf ind "LEAVE " lbl ";\n"; next
       }
