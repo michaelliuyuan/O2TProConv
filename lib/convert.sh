@@ -571,6 +571,8 @@ _mark_complex() {
       if ($0 ~ /(^|[^A-Za-z0-9_])TO_DATE[ \t]*\(/)  todo("TO_DATE(复杂参数/无掩码) 需人工 STR_TO_DATE（简单 TO_DATE(str,'mask') 已自动转 STR_TO_DATE，此处排除 STR_TO_DATE 子串假阳性）")
       if ($0 ~ /LISTAGG/)                        todo("LISTAGG(..) WITHIN GROUP(ORDER BY ..) 需改 GROUP_CONCAT(.. ORDER BY .. SEPARATOR ..)")
       if ($0 ~ /DBMS_OUTPUT/)                    todo("DBMS_OUTPUT 需改 SELECT 结果 / 写日志表")
+      if ($0 ~ /(^|[^A-Za-z0-9_])GOTO[ \t]+[A-Za-z_]/) todo("GOTO 语句 MySQL 不支持，需改写为 IF/LOOP/LEAVE 控制流")
+      if ($0 ~ /<<[A-Za-z_][A-Za-z0-9_]*>>/) todo("GOTO 标签 <<label>> MySQL 不支持，需配合 GOTO 改写移除")
       # 注：EXCEPTION 块（WHEN NO_DATA_FOUND/OTHERS）/ 显式游标 CURSOR..IS / 数值 FOR..IN 现由 _restructure
       # 自动转换（EXIT handler / DECLARE..CURSOR FOR + done / WHILE+计数器）；游标/REVERSE FOR 在 _restructure
       # 内单独标 TODO。此处不再标 FOR/EXCEPTION/CURSOR，避免残留假阳性。
@@ -645,11 +647,14 @@ _param_mode() {
 #   - EXCEPTION 提升（架构 spec：块级 EXIT，非 CONTINUE）：NO_DATA_FOUND→`EXIT HANDLER FOR NOT FOUND`，
 #     OTHERS→`EXIT HANDLER FOR SQLEXCEPTION` + `GET DIAGNOSTICS CONDITION 1 v_errmsg = MESSAGE_TEXT`，`SQLERRM`→`v_errmsg`
 #   - fabricated：显式游标场景 `done INT DEFAULT 0` + `CONTINUE HANDLER FOR NOT FOUND SET done=1`；OTHERS 场景 `v_errmsg VARCHAR(255)`
+#   - 嵌套 DECLARE..BEGIN..END：Oracle `DECLARE <decls> BEGIN <body> END;`→MySQL `BEGIN DECLARE <decls> <body> END;`
+#     （block_depth 跟踪，嵌套 EXCEPTION 标 TODO）
 # 组装序严守 MySQL 强制 DECLARE 序：变量/条件（含 done/v_errmsg）→ 游标 → handler → body。
-# 注：顶层为主；嵌套 DECLARE..BEGIN..END / 自定义异常 CONDITION / RAISE_APPLICATION_ERROR / FOR..IN 未覆盖（标 known-limitation）。
+# 注：顶层为主；嵌套 DECLARE..BEGIN..END 已自动转换（变量→DECLARE 前置，嵌套 EXCEPTION 标 TODO）；
+#   自定义异常 CONDITION / RAISE_APPLICATION_ERROR 未覆盖（标 known-limitation）。
 _restructure() {
   awk '
-    BEGIN { state="pre"; IGNORECASE=1; ltop=0; labeln=0; has_ndf=0; has_others=0; done_needed=0; in_cursor=0 }
+    BEGIN { state="pre"; IGNORECASE=1; ltop=0; labeln=0; has_ndf=0; has_others=0; done_needed=0; in_cursor=0; block_depth=0; nested_decl_buf="" }
     function newlabel(){ labeln++; return "lp" labeln }
     function is_as_is_line(line) {
       return (line ~ /^[ \t]*(AS|IS)[ \t]*$/) || (line ~ /[)A-Za-z0-9_][ \t]+(AS|IS)[ \t]*$/)
@@ -726,6 +731,28 @@ _restructure() {
         if (line ~ /^[ \t]*BEGIN[ \t]*$/) { state="body"; next }            # BEGIN 在 assemble() 里发
         d=conv_decl(line); if (d=="") next; varbuf=(varbuf==""?"":varbuf "\n") d; next
       }
+      if (state=="nested_decl") {
+        if (line ~ /^[ \t]*BEGIN[ \t]*$/) {
+          bodybuf=bodybuf line "\n"
+          if (nested_decl_buf != "") bodybuf=bodybuf nested_decl_buf
+          nested_decl_buf=""
+          block_depth++
+          state="body"
+          next
+        }
+        if (line ~ /^[ \t]*EXCEPTION[ \t]*$/) {
+          bodybuf=bodybuf "-- TODO(需人工转换): 嵌套 EXCEPTION 块\n"
+          if (nested_decl_buf != "") bodybuf=bodybuf nested_decl_buf
+          nested_decl_buf=""
+          state="body"
+          next
+        }
+        if (line ~ /^[ \t]*--/) next
+        if (line ~ /^[ \t]*$/) next
+        d=conv_decl(line); if (d=="") next
+        nested_decl_buf=nested_decl_buf d "\n"
+        next
+      }
       if (state=="exception") {
         if (line ~ /^[ \t]*WHEN[ \t]+OTHERS[ \t]+THEN/)        { exc_curr="others"; has_others=1; next }
         if (line ~ /^[ \t]*WHEN[ \t]+NO_DATA_FOUND[ \t]+THEN/) { exc_curr="ndf";    has_ndf=1;     next }
@@ -737,7 +764,10 @@ _restructure() {
         next
       }
       # state == body
-      if (line ~ /^[ \t]*EXCEPTION[ \t]*$/) { state="exception"; exc_curr=""; next }
+      if (line ~ /^[ \t]*EXCEPTION[ \t]*$/) {
+        if (block_depth > 0) { bodybuf=bodybuf "-- TODO(需人工转换): 嵌套 EXCEPTION 块\n"; next }
+        state="exception"; exc_curr=""; next
+      }
       if (line ~ /^[ \t]*END[ \t]+LOOP/) {                                     # END LOOP：FOR→SET 计数器+1 + END WHILE label；WHILE→END WHILE；LOOP→保留
         ind=getindent(line)
         if (ltop>0) {
@@ -794,7 +824,17 @@ _restructure() {
         ind=getindent(line); lbl=(ltop>0?llabel[ltop]:"lp1")
         bodybuf=bodybuf ind "LEAVE " lbl ";\n"; next
       }
-      if (is_sp_end(line)) { assemble(); state="end"; next }
+      if (line ~ /^[ \t]*DECLARE[ \t]*$/) {                               # 嵌套 DECLARE..BEGIN..END
+        state="nested_decl"; nested_decl_buf=""; next
+      }
+      if (line ~ /^[ \t]*BEGIN[ \t]*$/) {                                 # 嵌套 BEGIN
+        block_depth++; bodybuf=bodybuf line "\n"; next
+      }
+      if (line ~ /^[ \t]*END[ \t]*;?[ \t]*$/) {                           # END（嵌套或 SP 终止）
+        if (block_depth > 0) { block_depth--; bodybuf=bodybuf line "\n"; next }
+        assemble(); state="end"; next
+      }
+      if (block_depth == 0 && is_sp_end(line)) { assemble(); state="end"; next }
       l=conv_assign(line); bodybuf=bodybuf l "\n"
     }
   '
