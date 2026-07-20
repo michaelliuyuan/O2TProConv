@@ -195,9 +195,18 @@ _split_package_body() {
     }
     {
       if (in_sp) sp_buf[sp_lines++] = $0
-      # 检测子程序结束：END 后跟过程名或分号（非 END IF/LOOP/CASE）
-      if (in_sp && $0 ~ /^[ \t]*END[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*;/) {
-        flush_sp()
+      # 检测子程序结束：END 后跟**当前子程序名**或单独分号（非 END IF/LOOP/CASE）
+      # Bug #4 修复：原正则匹配任意 END <name>; 会误匹配 PACKAGE BODY 的 END <pkg_name>;
+      # → 子程序 buffer 含 pkg END → flush_sp 输出含多余内容；END{} 再 flush → 重复
+      if (in_sp) {
+        if ($0 ~ /^[ \t]*END[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*;/) {
+          # 校验 END 后的名字是否=当前子程序名（避免误匹配 PACKAGE END）
+          end_name=$0; sub(/^[ \t]*END[ \t]+/,"",end_name); sub(/[ \t]*;.*/,"",end_name)
+          if (tolower(end_name) == tolower(sp_name)) flush_sp()
+        } else if ($0 ~ /^[ \t]*END[ \t]*;/) {
+          # END; 无名 → 子程序结束（Oracle 允许 END; 不带名）
+          flush_sp()
+        }
       }
     }
     function flush_sp(   fname, i) {
@@ -801,6 +810,8 @@ _mark_complex() {
       if ($0 ~ /%TYPE|%ROWTYPE/)                 todo("锚定类型 %TYPE/%ROWTYPE 需解析为具体类型")
       # 注：EXECUTE IMMEDIATE 现由 _restructure 半自动转 PREPARE/EXECUTE/DEALLOCATE（INTO 子句标 TODO）
       if ($0 ~ /BULK[ \t]+COLLECT|FORALL/)       todo("批量操作 BULK COLLECT/FORALL 无直接对应，需改写为游标循环")
+      # Oracle PL/SQL 集合类型声明（关联 BULK COLLECT）→ MySQL 无对应，标 TODO
+      if ($0 ~ /^[ \t]*TYPE[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IS[ \t]+(TABLE[ \t]+OF|RECORD|VARRAY)/) todo("PL/SQL 集合/RECORD 类型 MySQL 无对应，需改临时表或 JSON")
       # 注：TRUNC / INSTR / TO_NUMBER / TO_CHAR(number) / SUBSTR(0-offset) / NEXTVAL 现由 _convert_type_aware
       # （Phase 1 类型推断，置 _restructure 后）按 symtab 自动转换；不确定项在那 pass 内注 TODO。此处不再标，避免残留假阳性。
       if ($0 ~ /(^|[^A-Za-z0-9_])TO_DATE[ \t]*\(/)  todo("TO_DATE(复杂参数/无掩码) 需人工 STR_TO_DATE（简单 TO_DATE(str,'mask') 已自动转 STR_TO_DATE，此处排除 STR_TO_DATE 子串假阳性）")
