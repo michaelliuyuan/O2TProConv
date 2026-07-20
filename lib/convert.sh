@@ -327,6 +327,7 @@ _apply_mechanical() {
     -e 's/\bNVARCHAR2\b/NVARCHAR(4000)/gI' \
     -e 's/\bVARCHAR2[ \t]*\(/VARCHAR(/gI' \
     -e 's/\bVARCHAR2\b/VARCHAR(4000)/gI' \
+    -e 's/\bRAW[ \t]*\(/VARBINARY(/gI' \
     -e 's/\bNUMBER\(/DECIMAL(/gI' \
     -e 's/\bNUMBER\b/DECIMAL(65,30)/gI' \
     -e 's/\bPLS_INTEGER\b/INT/gI' \
@@ -343,8 +344,9 @@ _apply_mechanical() {
     -e 's/\bELSIF\b/ELSEIF/gI' \
     -e 's/^\/$//'                       # 去掉 Oracle 的 `/` 执行终止行
   # 说明：|| 与 DECODE 现由 _convert_known_semantics 做「忠实版自动转换」（已知语义差，默认开启）；
-  #   转不了的（跨行/操作数边界不可靠）才注入 TODO。DATE(类型)/%TYPE/EXECUTE IMMEDIATE/FOR..IN/
+  #   转不了的（跨行/操作数边界不可靠）才注入 TODO。DATE(类型)/%TYPE/FOR..IN/
   #   BULK COLLECT/EXCEPTION/CURSOR..IS/DBMS_OUTPUT 仍由 _mark_complex 标人工。
+  #   EXECUTE IMMEDIATE 现由 _restructure 半自动转 PREPARE/EXECUTE/DEALLOCATE。
 }
 
 # 已知 Oracle↔MySQL 语义差的忠实版自动转换（架构师决策：已知语义差→忠实修、默认开启；
@@ -749,7 +751,7 @@ _mark_complex() {
       # 生成 IFNULL(op,'')，与 NVL(x,'') 文本同形、post-mechanical 无法区分，全量标记只会误报每一处
       # ||。NVL(x,'') 分歧属已知 niche 边缘，由文档记录、不在此标记。
       if ($0 ~ /%TYPE|%ROWTYPE/)                 todo("锚定类型 %TYPE/%ROWTYPE 需解析为具体类型")
-      if ($0 ~ /EXECUTE[ \t]+IMMEDIATE/)         todo("动态 SQL EXECUTE IMMEDIATE 需改 PREPARE/EXECUTE/DEALLOCATE")
+      # 注：EXECUTE IMMEDIATE 现由 _restructure 半自动转 PREPARE/EXECUTE/DEALLOCATE（INTO 子句标 TODO）
       if ($0 ~ /BULK[ \t]+COLLECT|FORALL/)       todo("批量操作 BULK COLLECT/FORALL 无直接对应，需改写为游标循环")
       # 注：TRUNC / INSTR / TO_NUMBER / TO_CHAR(number) / SUBSTR(0-offset) / NEXTVAL 现由 _convert_type_aware
       # （Phase 1 类型推断，置 _restructure 后）按 symtab 自动转换；不确定项在那 pass 内注 TODO。此处不再标，避免残留假阳性。
@@ -1094,6 +1096,53 @@ _restructure() {
         assemble(); state="end"; next
       }
       if (block_depth == 0 && is_sp_end(line)) { assemble(); state="end"; next }
+      # EXECUTE IMMEDIATE 'sql' [INTO ...] [USING ...]; → PREPARE/EXECUTE/DEALLOCATE
+      if (line ~ /^[ \t]*EXECUTE[ \t]+IMMEDIATE[ \t]+/) {
+        ind=getindent(line); core=substr(line,length(ind)+1)
+        sub(/^EXECUTE[ \t]+IMMEDIATE[ \t]+/,"",core); sub(/;[ \t]*$/,"",core)
+        # 解析：sql_expr [INTO vars] [USING vars]
+        # sql_expr 可能是 'literal' || var 或 var。先尝试匹配 INTO/USING 子句（须在引号外）。
+        # 策略：先尝试匹配 INTO 子句（仅当 INTO 后跟标识符列表、非 SQL 字面量内）。
+        sql_expr=core; into_vars=""; using_vars=""
+        # 检查 USING（通常在最后）：找最后一个 " USING "
+        u_idx = match(toupper(core), /[ \t]USING[ \t]+/)
+        if (u_idx > 0) {
+          sql_expr = substr(core, 1, u_idx - 1)
+          using_vars = substr(core, u_idx + 1)
+          sub(/^[ \t]*USING[ \t]+/,"",using_vars)
+        }
+        # 检查 INTO（在 sql_expr 内但须在引号外——简化：INTO 后跟变量列表、非表名）
+        # Oracle EXECUTE IMMEDIATE 'sql' INTO var [, var...] [USING ...]
+        # 判定：sql_expr 含 " INTO " 且 INTO 不在引号内。简单启发：sql_expr 以引号结尾后才匹配 INTO。
+        # awk 在 bash 单引号内，用 \047（单引号 ASCII）避免提前终止 awk 字符串
+        i_idx = match(toupper(sql_expr), /\047[ \t]+INTO[ \t]+/)
+        if (i_idx > 0) {
+          into_vars = substr(sql_expr, i_idx + 1)   # " INTO vars"
+          sub(/^[ \t]*INTO[ \t]+/,"",into_vars)
+          sql_expr = substr(sql_expr, 1, i_idx)
+        } else {
+          # 也检查非引号结尾的 INTO（如 EXECUTE IMMEDIATE v_sql INTO x）
+          i_idx = match(sql_expr, /[ \t]INTO[ \t]+/)
+          if (i_idx > 0 && substr(sql_expr, i_idx-1, 1) !~ /[A-Za-z0-9_]/) {
+            into_vars = substr(sql_expr, i_idx + 1)
+            sub(/^[ \t]*INTO[ \t]+/,"",into_vars)
+            sql_expr = substr(sql_expr, 1, i_idx - 1)
+          }
+        }
+        gsub(/^[ \t]+|[ \t]+$/,"",sql_expr)
+        has_into = (into_vars != "")
+        # 预组装 EXECUTE 子句后缀（USING 部分）
+        exec_suffix = (using_vars != "" ? " USING " using_vars : "")
+        # 生成 PREPARE/EXECUTE/DEALLOCATE 框架
+        bodybuf=bodybuf ind "SET @sql = " sql_expr ";\n"
+        bodybuf=bodybuf ind "PREPARE stmt FROM @sql;\n"
+        if (has_into) {
+          bodybuf=bodybuf ind "EXECUTE stmt" exec_suffix "; -- TODO(需人工转换): Oracle INTO " into_vars " MySQL PREPARE 无单行 SELECT 返回对应，需改 DECLARE+OPEN/FETCH 游标\n"
+        } else {
+          bodybuf=bodybuf ind "EXECUTE stmt" exec_suffix ";\n"
+        }
+        bodybuf=bodybuf ind "DEALLOCATE PREPARE stmt;\n"; next
+      }
       l=conv_assign(line); bodybuf=bodybuf l "\n"
     }
   '
