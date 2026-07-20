@@ -13,9 +13,165 @@ run_compare() {
   local sub="${1:-}"
   case "$sub" in
     --validate-cases) shift || true; validate_cases "$@" ;;
-    "") die "compare 待 M3（gated 决策② TiDB 版本+连接）。离线可先校验用例：ora2tidb compare --validate-cases <cases 目录> [--spec test-cases.md]" ;;
-    *)  die "未知 compare 子参数: $sub" ;;
+    --run)            shift || true; run_exec "$@" ;;
+    "")               run_exec ;;
+    *)  die "未知 compare 子参数: $sub（--validate-cases 离线校验 / --run [-c conf] DB 一致性对比）" ;;
   esac
+}
+
+# ===== M3 Cut 1：一致性路径（两端 CALL → 归一 → 值级 diff → 报告）。perf 留 Cut 2。=====
+# 解析 .cases → TSV（每 case 一行：id \t sp \t capture \t args \t norm \t perf）
+#   args 保留 in/out 形参**声明顺序**（位置参数），形如 "in:p_empno=7839;out:p_bonus;out:p_label"
+#   out 的期望值不进 args（仅名）；期望值单独取（_parse 同时回填到一个关联查询——Cut 1 简化：out 行 =期望，args 里只记名，期望从 out 行原值取）。
+_cmp_parse() {
+  awk '
+    function kv(line, key,   m) { m=key "=([^ \t]+)"; if (match(line,m)) return substr(line,RSTART+length(key)+1,RLENGTH-length(key)-1); return "" }
+    function flush() {
+      if (id != "") {
+        # 从 args 抽 out 期望（out:name=value → 期望存 out_exp[name]=value，args 留 out:name）
+        print id "\t" sp "\t" capture "\t" args "\t" norm "\t" perf "\t" outexp
+      }
+      id=sp=capture=args=norm=perf=outexp=""
+    }
+    /^@@case[ \t]/ { flush(); id=kv($0,"id"); sp=kv($0,"sp"); capture=kv($0,"capture"); next }
+    /^[ \t]*#/  { next }
+    /^[ \t]*$/  { next }
+    /^[ \t]*in[ \t]/  { v=$0; sub(/^[ \t]*in[ \t]+/,"",v);  args =(args ==""?"":args ";")  "in:"  v }
+    /^[ \t]*out[ \t]/ { v=$0; sub(/^[ \t]*out[ \t]+/,"",v);
+                       nm=v; sub(/=.*$/,"",nm);
+                       args =(args ==""?"":args ";") "out:" nm;
+                       outexp=(outexp==""?"":outexp ";") v }
+    /^[ \t]*norm[ \t]/{ v=$0; sub(/^[ \t]*norm[ \t]+/,"",v); norm=(norm==""?"":norm " ") v }
+    /^[ \t]*perf[ \t]/{ v=$0; sub(/^[ \t]*perf[ \t]+/,"",v); perf=(perf==""?"":perf " ") v }
+    END { flush() }
+  ' "$1"
+}
+
+# 展开 <DATE:Oraclefmt> 占位为今日日期（两端同日）
+_cmp_expand_date() {
+  local v="$1" out=""
+  while [[ "$v" == *"<DATE:"*">"* ]]; do
+    local pre="${v%%<DATE:*}" fmt="${v#*<DATE:}"; fmt="${fmt%%>*}"; v="${v#*<DATE:$fmt>}"
+    local df="$fmt"
+    df="${df//YYYY/%Y}"; df="${df//YY/%y}"; df="${df//MM/%m}"; df="${df//DD/%d}"; df="${df//HH24/%H}"; df="${df//MI/%M}"; df="${df//SS/%S}"
+    out+="$pre$(date +"$df")"
+  done
+  printf '%s' "$out$v"
+}
+
+# 归一化值（按 norm 选项，空格分隔）
+_cmp_norm() {
+  local v="$1" opts="$2"
+  [[ "$opts" == *null_as=NULL* && -z "$v" ]] && v="NULL"
+  if [[ "$opts" == *num_str_strip_zeros* ]]; then
+    v="$(printf '%s' "$v" | awk '{ n=$0; if(n~/\./){ sub(/0+$/,"",n); sub(/\.$/,"",n) }; print n }')"
+  fi
+  if [[ "$opts" == *trim* ]]; then v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"; fi
+  if [[ "$opts" == *collapse_ws* ]]; then v="$(printf '%s' "$v" | tr -s '[:space:]' ' ')"; fi
+  [[ "$opts" == *upper* ]] && v="${v^^}"
+  printf '%s' "$v"
+}
+
+# 值级 diff：expected（字面/~正则/<DATE>）vs actual（已归一）。0=匹配 1=不同
+_cmp_diff() {
+  local expected="$1" actual="$2" opts="$3"
+  expected="$(_cmp_expand_date "$expected")"
+  if [[ "$expected" == "~"* ]]; then
+    printf '%s' "$actual" | grep -qE "${expected:1}" && return 0 || return 1
+  fi
+  [[ "$(_cmp_norm "$expected" "$opts")" == "$(_cmp_norm "$actual" "$opts")" ]] && return 0 || return 1
+}
+
+# 生成 TiDB CALL（@vars + SELECT），返回完整 mysql 脚本（输入 stdin 无关，靠参数）
+# $1=sp $2=capture $3=args(ordered) → stdout = mysql SQL（末尾 SELECT 抓 OUT/return）
+_cmp_gen_tidb() {
+  local sp="$1" capture="$2" args="$3"
+  local sets="" sels="" IFS=';' kv tag name val
+  local -a callargs=()
+  if [[ "$capture" == "function" ]]; then
+    for kv in $args; do tag="${kv%%:*}"; val="${kv#*:}"; [[ "$tag" == "in" ]] && callargs+=( "${val#*=}" ); done
+    printf 'SELECT %s(%s);\n' "$sp" "$(IFS=','; printf '%s' "${callargs[*]}")"
+    return
+  fi
+  # procedure: out_param/inout/result_set → @vars
+  for kv in $args; do
+    tag="${kv%%:*}"; name="${kv#*:}"
+    if [[ "$tag" == "in" ]]; then
+      val="${name#*=}"; callargs+=( "$val" )
+    else  # out
+      sets+="SET @$name=NULL;"; callargs+=( "@$name" ); sels+="@$name,"
+    fi
+  done
+  printf '%sCALL %s(%s);\n' "$sets" "$sp" "$(IFS=','; printf '%s' "${callargs[*]}")"
+  [[ -n "$sels" ]] && printf 'SELECT %s;\n' "${sels%,}"
+}
+
+# 生成 Oracle 调用脚本（sqlplus，VAR ...; EXEC sp(...,:out); PRINT out;）
+_cmp_gen_oracle() {
+  local sp="$1" capture="$2" args="$3"
+  local vars="" prints="" IFS=';' kv tag name val
+  local -a callargs=()
+  if [[ "$capture" == "function" ]]; then
+    for kv in $args; do tag="${kv%%:*}"; val="${kv#*:}"; [[ "$tag" == "in" ]] && callargs+=( "${val#*=}" ); done
+    printf 'SELECT %s(%s) FROM dual;\n' "$sp" "$(IFS=','; printf '%s' "${callargs[*]}")"
+    printf 'EXIT;\n'; return
+  fi
+  for kv in $args; do
+    tag="${kv%%:*}"; name="${kv#*:}"
+    if [[ "$tag" == "in" ]]; then callargs+=( "${name#*=}" )
+    else vars+="VAR $name VARCHAR2(4000);\n"; callargs+=( ":$name" ); prints+="PRINT $name;\n"; fi
+  done
+  printf '%b' "$vars"
+  printf 'EXEC %s(%s);\n' "$sp" "$(IFS=','; printf '%s' "${callargs[*]}")"
+  printf '%b' "$prints"
+  printf 'EXIT;\n'
+}
+
+# 抓 TiDB SELECT 输出里的值（按列序，tab/换行分隔）→ 与 outexp 顺序对齐
+# 简化：取 SELECT 输出的非表头数据行，第一行按 tab 分列。
+_cmp_capture_tidb() { awk 'NR>1 && !/^[@a-zA-Z_]/ {print} /^[a-zA-Z_]/ {next}' | tail -n +1 | head -1; }
+
+run_exec() {
+  : "${CASES_DIR:?compare 需 CASES_DIR（ora2tidb.conf）}"
+  [[ -d "$CASES_DIR" ]] || die "CASES_DIR 不存在: $CASES_DIR"
+  require_cmd sqlplus mysql awk
+  resolve_dir REPORT_DIR; mkdir -p "$REPORT_DIR"
+  local report="$REPORT_DIR/compare_report.md"
+  { echo "# 一致性对比报告（M3 Cut 1）"; echo; echo "- Oracle: ${ORACLE_USER}@${ORACLE_HOST}"; echo "- TiDB: ${TIDB_USER}@${TIDB_HOST}"; echo "- 用例: $CASES_DIR"; echo; echo "| 用例 | SP | capture | 结果 |"; echo "|------|----|---------|------|"; } >"$report"
+  shopt -s nullglob
+  local f id sp capture args norm perf outexp pass total=0 ok=0
+  for f in "$CASES_DIR"/*.cases; do
+    while IFS=$'\t' read -r id sp capture args norm perf outexp; do
+      [[ -z "$id" ]] && continue
+      total=$((total+1)); pass="✅"
+      local tsql osql tout oout
+      tsql="$(_cmp_gen_tidb "$sp" "$capture" "$args")"
+      osql="$(_cmp_gen_oracle "$sp" "$capture" "$args")"
+      # TiDB 执行 + 抓 OUT
+      if tout="$(printf '%s\n%s\n' "USE $TIDB_DB;" "$tsql" | mysql_tidb 2>&1)"; then :; else pass="❌ TiDB执行错"; fi
+      # Oracle 执行 + 抓 OUT（sqlplus）
+      oout="$(printf '%s\n%s\n' "WHENEVER OSERROR EXIT;" "$osql" | sqlplus -S "$(oracle_connect)" 2>&1)" || pass="❌ Oracle执行错"
+      # 值级 diff（outexp 形如 "p_bonus=750;p_label=A_<DATE:YYYYMMDD>"，按 ; 分项）
+      if [[ "$pass" == "✅" && -n "$outexp" ]]; then
+        local IFS=';' oe exp_name exp_val
+        # TiDB 输出按列取（outexp 顺序 = args 里 out 顺序）
+        local ncols; ncols="$(printf '%s' "$tout" | awk 'NR==2{print NF}' 2>/dev/null)"
+        local i=0
+        for oe in $outexp; do
+          exp_name="${oe%%=*}"; exp_val="${oe#*=}"
+          local actval; actval="$(printf '%s' "$tout" | awk -v c=$((i+1)) 'NR==2{print $c}')"
+          if ! _cmp_diff "$exp_val" "$actval" "$norm"; then pass="❌ $exp_name: 期望[$exp_val] 实际[$actval]"; break; fi
+          i=$((i+1))
+        done
+      fi
+      [[ "$pass" == "✅" ]] && ok=$((ok+1))
+      printf '| %s | %s | %s | %s |\n' "$id" "$sp" "$capture" "$pass" >>"$report"
+      log "  $id [$sp/$capture] → $pass"
+    done < <(_cmp_parse "$f")
+  done
+  shopt -u nullglob
+  { echo; echo "**合计**：$total 用例，$ok 一致。"; } >>"$report"
+  info "一致性对比完成：$ok/$total 一致；报告 $report"
 }
 
 # 离线校验：① cases/*.cases 格式；② 与 test-cases.md 的覆盖一致性（防双源漂移）。不连库。
