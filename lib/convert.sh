@@ -213,12 +213,84 @@ _split_package_body() {
   printf '%s' "$sp_list"
 }
 
+# %TYPE 锚定类型解析：查 _schema_columns.tsv 将 table.column%TYPE / column%TYPE
+# 替换为具体 Oracle 类型（后续由 _apply_mechanical 统一转 MySQL 类型）。
+# 位置：在 _apply_mechanical 前（输出 Oracle 原生类型，复用机械层映射），
+#       在 _mark_complex 前（解析成功的不再标 TODO）。
+# 离线 fallback：无 _schema_columns.tsv 或列未匹配 → 原样保留（由 _mark_complex 兜底 TODO）。
+# SCHEMA_COLUMNS 环境变量可覆盖默认路径（$ORACLE_DIR/_schema_columns.tsv）。
+_resolve_anchor_type() {
+  local cols_file="${SCHEMA_COLUMNS:-${ORACLE_DIR:-$EXPORT_DIR}/_schema_columns.tsv}"
+  [[ -f "$cols_file" ]] || { cat; return 0; }   # 无 schema 数据 → 原样透传
+  gawk -v cols="$cols_file" '
+    BEGIN {
+      # 加载 schema 列定义：key="OWNER.TABLE.COLUMN" → val=Oracle 类型表达式
+      while ((getline line < cols) > 0) {
+        n = split(line, f, "\t")
+        if (n < 8) continue
+        owner = toupper(f[1]); tab = toupper(f[2]); col = toupper(f[3])
+        dtype = toupper(f[4]); dlen = f[5]; dprec = f[6]; dscale = f[7]
+        key = owner SUBSEP tab SUBSEP col
+        coltype[key] = type_expr(dtype, dlen, dprec, dscale)
+      }
+      close(cols)
+    }
+    # 按 Oracle 元数据生成类型表达式（与 _apply_mechanical 的输入约定一致）
+    function type_expr(dt, dl, dp, ds,    t) {
+      t = dt
+      if (t == "VARCHAR2" || t == "CHAR" || t == "NVARCHAR2" || t == "NCHAR" || t == "RAW") {
+        return t "(" dl ")"
+      }
+      if (t == "NUMBER") {
+        if (dp != "" && ds != "") return "NUMBER(" dp "," ds ")"
+        if (dp != "") return "NUMBER(" dp ")"
+        return "NUMBER"
+      }
+      return t   # DATE/FLOAT/TIMESTAMP(6)/BLOB/CLOB 等原样返回
+    }
+    {
+      line = $0
+      if (line ~ /^[[:space:]]*--/) { print; next }
+      # 反复找 %TYPE 锚定并替换；找不到或解析失败则跳出（留给 _mark_complex）
+      while (match(line, /[A-Za-z_][A-Za-z0-9_]*([.][A-Za-z_][A-Za-z0-9_]*){0,2}%TYPE/)) {
+        pre = substr(line, 1, RSTART - 1)
+        anchor = substr(line, RSTART, RLENGTH)
+        post = substr(line, RSTART + RLENGTH)
+        rt = resolve(anchor)
+        if (rt == "") break   # 本行后续无法继续安全替换（避免死循环）
+        line = pre rt post
+      }
+      print line
+    }
+    function resolve(anchor,    a, np, parts, tab, col, owner, k, kk) {
+      a = anchor; sub(/%TYPE$/, "", a)
+      np = split(a, parts, ".")
+      if (np == 2) {
+        # table.column%TYPE：owner 缺省 → 匹配任意 owner
+        tab = toupper(parts[1]); col = toupper(parts[2])
+        for (k in coltype) {
+          split(k, kk, SUBSEP)
+          if (kk[2] == tab && kk[3] == col) return coltype[k]
+        }
+        return ""
+      } else if (np == 3) {
+        owner = toupper(parts[1]); tab = toupper(parts[2]); col = toupper(parts[3])
+        k = owner SUBSEP tab SUBSEP col
+        return (k in coltype) ? coltype[k] : ""
+      }
+      # np==1（column%TYPE 无表前缀）或其他 → 不处理（需 symtab，留给 _convert_type_aware）
+      return ""
+    }
+  '
+}
+
 # 转换单个文件
 convert_one() {
   local in="$1" out="$2"
   local text; text="$(cat "$in")"
-  text="$(_tochar_date    <<<"$text")"
-  text="$(_apply_mechanical <<<"$text")"
+  text="$(_tochar_date       <<<"$text")"
+  text="$(_resolve_anchor_type <<<"$text")"
+  text="$(_apply_mechanical  <<<"$text")"
   text="$(_convert_known_semantics <<<"$text")"
   text="$(_fix_header     <<<"$text")"
   text="$(_mark_complex   <<<"$text")"

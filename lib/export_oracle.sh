@@ -78,5 +78,31 @@ SQL
     log "  [$i/$total] ${otype} ${owner}.${name} → $(wc -l <"$out") 行"
   done < "$list_file"
 
+  # 3) 导出 schema 列定义 → _schema_columns.tsv（供 convert 的 %TYPE 锚定类型解析）
+  # 字段：owner<TAB>table_name<TAB>column_name<TAB>data_type<TAB>data_length<TAB>data_precision<TAB>data_scale<TAB>nullable
+  # 失败不阻断 export 主流程（列定义是 convert 的增强数据源，缺则 %TYPE 降级 TODO）。
+  local cols_file="$EXPORT_DIR/_schema_columns.tsv"
+  if sqlplus -s -L "$conn" >"$cols_file" <<SQL
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF LINESIZE 32767 TRIMSPOOL ON
+WHENEVER OSERROR EXIT FAILURE;
+WHENEVER SQLERROR EXIT FAILURE;
+SELECT owner || CHR(9) || table_name || CHR(9) || column_name || CHR(9) ||
+       data_type || CHR(9) || data_length || CHR(9) ||
+       NVL(TO_CHAR(data_precision), '') || CHR(9) ||
+       NVL(TO_CHAR(data_scale), '') || CHR(9) ||
+       nullable
+FROM   all_tab_columns
+WHERE  owner = UPPER('$schema')
+ORDER BY owner, table_name, column_id;
+EXIT;
+SQL
+  then
+    local col_count; col_count=$(grep -c . "$cols_file" || true)
+    info "schema 列定义导出：$col_count 行 → $cols_file"
+  else
+    warn "schema 列定义导出失败（%TYPE 解析将降级为 TODO）"
+    : >"$cols_file"
+  fi
+
   info "导出完成：$i 个文件写入 $EXPORT_DIR"
 }
