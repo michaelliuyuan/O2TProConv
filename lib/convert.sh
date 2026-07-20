@@ -880,7 +880,7 @@ _param_mode() {
 _nested_blocks() {
   awk '
     BEGIN { IGNORECASE=1; body_started=0; in_nested=0; nested_lines=0; nested_exc=0; nested_depth=0 }
-    function is_top_begin(line) { return line ~ /^[ \t]*BEGIN[ \t]*$/ }
+    function is_top_begin(line) { return !in_nested && line ~ /^[ \t]*BEGIN[ \t]*$/ }
     function is_nested_declare(line) { return body_started && !in_nested && line ~ /^[ \t]*DECLARE[ \t]*$/ }
     function is_nested_end(line) {
       if (!in_nested) return 0
@@ -902,6 +902,9 @@ _nested_blocks() {
           nested_depth++
           if (nested_depth > 1) nested[nested_lines-1] = "-- TODO(需人工转换): 多层嵌套 DECLARE..BEGIN..END 需人工展开"
         }
+        # 嵌套块 END; 先减 nested_depth，再检查是否应 flush（顺序修复：原 L905 在 L921 前，
+        # END; 时 nested_depth=1 不触发 flush，整个 SP 被 nested 吞掉 → 空输出）
+        if (line ~ /^[ \t]*END[ \t]*;?[ \t]*$/ && line !~ /END[ \t]+(IF|LOOP|CASE|FOR|REPEAT|WHILE)/) nested_depth--
         if (is_nested_end(line) && nested_depth == 0) {
           in_nested = 0
           if (nested_exc) {
@@ -913,12 +916,20 @@ _nested_blocks() {
               l = nested[i]
               if (l ~ /^[ \t]*BEGIN[ \t]*$/) continue
               if (l ~ /^[ \t]*END[ \t]*;?[ \t]*$/) continue
+              # 嵌套块内的声明行 "v T := x" → "DECLARE v T DEFAULT x"（有类型标识符）；
+              # 赋值行 "v := x"（无类型）→ "SET v = x"（不在 DECLARE 段，是 body）。
+              # 区分：声明行 := 前有 "identifier TYPE"（两个 token），赋值行 := 前只有 identifier。
+              if (l ~ /^[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]+[A-Za-z_][A-Za-z0-9_().,]*[ \t]*:=[ \t]/) {
+                gsub(/[ \t]*:=[ \t]*/, " DEFAULT ", l)
+                sub(/^[ \t]*/, "    DECLARE ", l)
+              } else if (l ~ /^[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*:=[ \t]/) {
+                l = gensub(/^([ \t]*)([A-Za-z_][A-Za-z0-9_]*)[ \t]*:=[ \t]*/, "\\1SET \\2 = ", "", l)
+              }
               print l
             }
             print "    END;"
           }
         }
-        if (line ~ /^[ \t]*END[ \t]*;?[ \t]*$/ && line !~ /END[ \t]+(IF|LOOP|CASE|FOR|REPEAT|WHILE)/) nested_depth--
         next
       }
       print line
