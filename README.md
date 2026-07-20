@@ -12,6 +12,28 @@
 
 > TiDB 存储过程兼容 MySQL 语法。
 
+## 架构与转换管线
+
+转换在 `lib/convert.sh` 内按**有序管线**逐 pass 处理每个 `.sql`，每 pass 只读 stdin、写 stdout。转换链路（`convert_one()`）：
+
+| 顺序 | pass | 职责 |
+|------|------|------|
+| 1 | `_tochar_date` | `TO_CHAR(date,'mask')` → `DATE_FORMAT(date,'%mask')`（须在机械层前，否则 `NOW()` 带括号匹配不到） |
+| 2 | `_apply_mechanical` | 确定性 token 替换（类型 / `NVL` / `SYSDATE` / `ELSIF` / 去 Oracle `/` …） |
+| 3 | `_convert_known_semantics` | 忠实语义：`DECODE`→`CASE(<=>)`、`||`→`NULLIF(CONCAT(IFNULL…),'')` |
+| 4 | `_fix_header` | 头部双引号标识符→反引号、去 `owner.` 前缀 |
+| 5 | `_mark_complex` | 复杂结构（`%TYPE` / `EXECUTE IMMEDIATE` / `BULK COLLECT` / …）注入 `-- TODO` |
+| 6 | `_rewrite_header` | `CREATE OR REPLACE` → `DROP IF EXISTS`+`CREATE`；FUNCTION 头 `RETURN<type>`→`RETURNS<type>` |
+| 7 | `_param_mode` | 参数模式前置（`name IN type`→`IN name type`）；FUNCTION 参数剥 `IN/OUT` |
+| 8 | `_restructure` | 结构改写：删 `AS/IS`、`:=` 两态、DECLARE 序重排、EXCEPTION→EXIT handler、显式游标、WHILE/FOR/CONTINUE |
+
+**三层 + 一条原则**：
+
+- **机械层**：确定性 token / 模式替换，零歧义。
+- **忠实语义层**：已知 Oracle↔MySQL 语义差，**默认开启**，产出与 Oracle 等价的 MySQL 写法。
+- **结构改写层**：Oracle `AS <decls> BEGIN <body> [EXCEPTION] END` → MySQL `BEGIN <vars> <cursors> <handlers> <body> END`，严守 MySQL 强制 DECLARE 序（变量/条件 → 游标 → handler）。
+- **原则（诚实边界）**：正则无法可靠判定的（跨行表达式、嵌套结构、字面量与运算符混排）**不臆造**，原样保留 + `-- TODO` + 报告汇总——强行转换的静默错误比「提示人工」更坏（典型：MySQL `||` 默认是逻辑或而非拼接）。
+
 ## 依赖
 
 bash ≥ 4；Oracle 侧 `sqlplus`/`sqlcl`；TiDB 侧 `mysql`；GNU `sed`/`gawk`；可选 `bc`/`jq`。
@@ -159,6 +181,114 @@ SOURCE converted/sp_format_report.tidb.sql;
 ./bin/ora2tidb all -c ora2tidb.conf   # export → convert（compare 为 M3，未串入）
 ```
 
+## 转换示例（Oracle → TiDB，真实输出）
+
+以一个含类型映射 / `:=` / `||` / EXCEPTION 的小过程为例（`convert_one` 实际产出）。
+
+**输入**（Oracle PL/SQL，`exported/calc_status.sql`）：
+
+```sql
+CREATE OR REPLACE PROCEDURE calc_status(
+    p_empno IN NUMBER,
+    p_status OUT VARCHAR2
+) AS
+    v_sal NUMBER;
+    v_grade NUMBER;
+BEGIN
+    SELECT salary INTO v_sal FROM emp WHERE empno = p_empno;
+    v_grade := CASE WHEN v_sal >= 3000 THEN 1 ELSE 2 END;
+    p_status := 'EMP:' || p_empno || '/G:' || v_grade;
+EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+        p_status := 'NOT_FOUND';
+    WHEN OTHERS THEN
+        p_status := 'ERR:' || SQLERRM;
+END;
+/
+```
+
+**输出**（`converted/calc_status.tidb.sql`，转换器实际产出）：
+
+```sql
+DROP PROCEDURE IF EXISTS `calc_status`;
+DELIMITER //
+CREATE PROCEDURE calc_status(
+    IN p_empno DECIMAL(65,30),
+    OUT p_status VARCHAR(4000)
+)
+BEGIN
+DECLARE v_sal DECIMAL(65,30);
+DECLARE v_grade DECIMAL(65,30);
+    DECLARE v_errmsg VARCHAR(255);
+    DECLARE EXIT HANDLER FOR NOT FOUND
+    BEGIN
+        SET p_status = 'NOT_FOUND';
+    END;
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1 v_errmsg = MESSAGE_TEXT;
+        SET p_status = NULLIF(CONCAT(IFNULL('ERR:',''), IFNULL(v_errmsg,'')),'');
+    END;
+    SELECT salary INTO v_sal FROM emp WHERE empno = p_empno;
+    SET v_grade = CASE WHEN v_sal >= 3000 THEN 1 ELSE 2 END;
+    SET p_status = NULLIF(CONCAT(IFNULL('EMP:',''), IFNULL(p_empno,''), IFNULL('/G:',''), IFNULL(v_grade,'')),'');
+END
+//
+DELIMITER ;
+```
+
+**改了什么**（源 → 输出）：
+
+| Oracle 源 | TiDB 输出 | 转换 pass |
+|-----------|-----------|-----------|
+| 裸 `NUMBER` / `VARCHAR2` | `DECIMAL(65,30)` / `VARCHAR(4000)`（报告 NOTE 不静默） | 机械层 |
+| `name IN type` | `IN name type` | `_param_mode` |
+| `:=`（执行段） | `SET … = …` | `_restructure` |
+| `'EMP:' \|\| p_empno \|\| …` | `NULLIF(CONCAT(IFNULL('EMP:',''),IFNULL(p_empno,''),…),'')` | 忠实语义层 |
+| `EXCEPTION WHEN NO_DATA_FOUND` | `DECLARE EXIT HANDLER FOR NOT FOUND BEGIN … END` | `_restructure` |
+| `WHEN OTHERS … SQLERRM` | `DECLARE EXIT HANDLER FOR SQLEXCEPTION … GET DIAGNOSTICS … v_errmsg` | `_restructure` |
+| `CREATE OR REPLACE PROCEDURE` | `DROP PROCEDURE IF EXISTS` + `CREATE`（幂等） | `_rewrite_header` |
+| Oracle `/` 终止行 | 去除；`DELIMITER //` 包裹 | `_apply_mechanical` + `convert_one` |
+| 声明序 | **变量 → handler**（MySQL 强制序，handler 最后） | `_restructure` assemble |
+
+## 测试与验收报告
+
+### 三维度验收
+
+| 维度 | 方法 | 通过准则 |
+|------|------|----------|
+| 转换正确性·编译 | 转换器输出在 TiDB `CREATE` | T1+T2 全 CREATE 成功、`DROP IF EXISTS` 幂等 |
+| 转换正确性·golden | 转换器输出 vs `golden/` 归一化文本 diff | 无语义差（仅格式差容忍） |
+| 结果一致性 | 共享 schema 两端同入参 CALL，归一化值级 diff | 全用例两端一致 |
+| T3 标记 | T3 样例被识别 | 全部打 `-- TODO` 并进报告 |
+| 性能 | 同入参两端各 CALL N 次 | 产出 p50/p99/加速比（信息性，不阻断） |
+
+### 验收结果（Oracle 23ai + TiDB v7.1.9，Route A）
+
+| 维度 | 结果 |
+|------|------|
+| 编译 | **T1+T2 共 8/8 CREATE-OK** ✅ |
+| golden 语义 | 通过（仅反引号 / `//` / DETERMINISTIC 格式差）✅ |
+| 结果一致性 | **单次连贯 33/33 全绿 @ `c9c2718`**（一个 mysql session、33 CALL、归一化后 vs Oracle 基线零 diff；覆盖 11 SP：T1×16 + T2×17）✅ |
+| T3 标记 | PACKAGE / `%ROWTYPE` / BULK COLLECT / EXECUTE IMMEDIATE / 集合 / 游标 FOR 全标 TODO ✅ |
+| 性能 | 报告产出 ✅ |
+
+**结构层转换逐条实证正确**：EXCEPTION→EXIT handler（NOT_FOUND 分叉对）、显式游标（top1 降序 + 0 行）、WHILE 分页、FUNCTION/INOUT、NULL-`||` 忠实写法、DECODE-`<=>`（NULL-search 实证 `<=>` 必要：simple CASE 漏判）、数值 FOR（含 1..0 空循环）、CONTINUE（前置递增无死循环）。
+
+### 测试中回流修复的 7 个 converter bug
+
+| # | bug | 发现 → 修复 |
+|---|-----|-------------|
+| 1 | `_restructure` 未定义 → convert 零输出 | `d34fb7a` → `ab04900` |
+| 2 | 裸 VARCHAR2→VARCHAR（丢长度）4/7 CREATE 失败 | `ab04900` → `27527b6` |
+| 3 | FUNCTION 参数误带 IN | `ab04900` → `27527b6` |
+| 4 | WHILE...LOOP 未转 | `ab04900` → `27527b6` |
+| 5 | EXCEPTION 块未转 | `ab04900` → `27527b6` |
+| 6 | 显式游标 CURSOR..IS 未转 | `ab04900` → `27527b6` |
+| 7 | 单行 FUNCTION 头 RETURN→RETURNS（type 正则漏逗号） | `27527b6` → `7dff66b` |
+
+> 测试语料库（companion 目录 `ora2tidb-sp-tests/`，由测试工程师维护）：17 个分级 Oracle SP 样例（T1×6 / T2×5 / T3×6）+ golden + 用例 + 共享 schema + 测试计划。分级 = 转换置信度（T1 简单 / T2 中等 / T3 复杂预期 TODO）。详细结果见语料库 `results/`。
+
 ## 里程碑（设计文档 §7）
 
 - **M1** export 模块 + TiDB SP 能力验证 — ✅ 代码就绪 + 能力探针实跑通过（TiDB v7.1.9，含 GET DIAGNOSTICS 实证）
@@ -174,7 +304,7 @@ SOURCE converted/sp_format_report.tidb.sql;
 - 忠实语义：`a||b→NULLIF(CONCAT(IFNULL(a,''),IFNULL(b,'')),'')`（简单链，NULL 安全）、`DECODE(e,s1,r1,..,def)→CASE WHEN e<=>s1 THEN r1 .. ELSE def END`（`<=>` null-safe）
 - 结构：EXCEPTION 块→`EXIT HANDLER`（NO_DATA_FOUND→`FOR NOT FOUND`、OTHERS→`FOR SQLEXCEPTION`+`GET DIAGNOSTICS`+`SQLERRM→v_errmsg`）；显式游标 `CURSOR c IS`→`DECLARE c CURSOR FOR`（+done 标志 + `CONTINUE HANDLER FOR NOT FOUND` + label + `EXIT WHEN c%NOTFOUND`→`IF done=1 THEN LEAVE`）；`WHILE..LOOP`→`WHILE..DO`；数值 `FOR v IN lo..hi LOOP`→`WHILE v<=hi DO`（+计数器递增）；`CONTINUE`→`ITERATE label`（FOR 内前置递增防死循环）；`:=`→`SET`/`DEFAULT`；DECLARE 序重排（变量/条件→游标→handler）；头部 `CREATE OR REPLACE`→`DROP IF EXISTS`+`CREATE`、双引号→反引号、去 owner 前缀、`RETURN<type>→RETURNS<type>`；去 Oracle `/` 终止行；`DELIMITER //` 包裹。
 
-**自动标记 `-- TODO(需人工转换)`**：跨表达式/跨行 `||`（**Route A 下留字面交 PIPES_AS_CONCAT**，TODO 标部署要求——见 Usage Step 5）、`%TYPE/%ROWTYPE`、`EXECUTE IMMUTE`、`BULK COLLECT/FORALL`、`TO_CHAR(number/复杂)`、`DBMS_OUTPUT`、游标/REVERSE `FOR..IN`、`GOTO`（MySQL 不支持）、嵌套 `DECLARE..BEGIN..END`。
+**自动标记 `-- TODO(需人工转换)`**：跨表达式/跨行 `||`（**Route A 下留字面交 PIPES_AS_CONCAT**，TODO 标部署要求——见 Usage Step 5）、`%TYPE/%ROWTYPE`、`EXECUTE IMMEDIATE`、`BULK COLLECT/FORALL`、`TO_CHAR(number/复杂)`、`DBMS_OUTPUT`、游标/REVERSE `FOR..IN`、`GOTO`（MySQL 不支持）、嵌套 `DECLARE..BEGIN..END`。
 
 **⚠️ DECLARE 顺序**（@测试工程师 抓的坑，已纳入）：转换器生成声明时按 **变量/条件 → 游标 → handler（handler 最后）**，capability 探针 `02_declare_order.sql` 实证。
 
