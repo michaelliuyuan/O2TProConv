@@ -401,6 +401,10 @@ TiDB 不支持裸 `:=` 赋值，转换器会自动将执行段 `:=` 转为 `SET 
 
 `-- TODO` 表示转换器无法可靠自动转换该处（如 `%ROWTYPE`、`EXECUTE IMMEDIATE`、`BULK COLLECT`、跨行 `||` 等），需人工介入。详见「转换覆盖」章节的诚实边界策略。
 
+### Q: 嵌套 DECLARE..BEGIN..END 能自动转换吗？
+
+能。Oracle 嵌套块 `DECLARE <decls> BEGIN <body> END` 会自动转为 MySQL `BEGIN DECLARE <decls> <body> END`。嵌套块内的 `:=` 转为 `DEFAULT`。嵌套 EXCEPTION 暂标 TODO，需人工处理。
+
 ### Q: 性能对比结果 TiDB 比 Oracle 慢很多？
 
 Oracle PL/SQL 原生循环调用接近 0 开销，TiDB 每次 `CALL` 约 3.5ms 调度开销。SP-heavy OLTP 场景迁移需评估此差异。建议使用 `PERF_WARMUP`（预热）和 `PERF_REPEAT`（重复次数）获取稳定数据。
