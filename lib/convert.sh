@@ -51,14 +51,16 @@ run_convert() {
       [[ "$dc" -gt 0 ]] && note_line+="DECIMAL(65,30)×${dc}"
       note_section+="${note_line}"$'\n'
     fi
-    # 语义差异 NOTE（@架构师 复核：下列函数已自动转但有已知语义差，需核对）——扫源文件 Oracle 函数名。
-    local sg mb n2 sem_line=""
+    # 语义差异 NOTE（@架构师 复核：下列函数/类型已自动转但有已知语义差，需核对）——扫源文件。
+    local sg mb n2 dt sem_line=""
     sg=$(grep -cE '(^|[^A-Za-z0-9_])SYS_GUID[[:space:]]*\(' "$f" || true)
     mb=$(grep -cE '(^|[^A-Za-z0-9_])MONTHS_BETWEEN[[:space:]]*\(' "$f" || true)
     n2=$(grep -cE '(^|[^A-Za-z0-9_])NVL2[[:space:]]*\(' "$f" || true)
+    dt=$(grep -cE '(^|[^A-Za-z0-9_])DATE([^A-Za-z0-9_]|$)' "$f" || true)
     [[ "$sg" -gt 0 ]] && sem_line+="SYS_GUID→UUID(Oracle 32-hex 无连字符 vs MySQL 36 带连字符)×${sg}；"
     [[ "$mb" -gt 0 ]] && sem_line+="MONTHS_BETWEEN→TIMESTAMPDIFF(Oracle 小数月 vs MySQL 整数月截断)×${mb}；"
     [[ "$n2" -gt 0 ]] && sem_line+="NVL2→IF(Oracle ''≡NULL vs MySQL ''≠NULL，空串路径分歧)×${n2}；"
+    [[ "$dt" -gt 0 ]] && sem_line+="DATE 类型(Oracle 带时分秒 vs MySQL DATE 仅日期，时间分量被截断——若依赖时间须改 DATETIME)×${dt}；"
     [[ -n "$sem_line" ]] && sem_section+="  - **$base**：${sem_line}"$'\n'
     log "  $base → $out（TODO: $todos）"
   done
@@ -88,7 +90,7 @@ run_convert() {
       echo
       printf '%s' "$sem_section"
     else
-      echo "无语义差异函数（或未使用 SYS_GUID / MONTHS_BETWEEN / NVL2）。"
+      echo "无语义差异（或未使用 SYS_GUID / MONTHS_BETWEEN / NVL2 / DATE 类型）。"
     fi
   } >>"$report"
 
