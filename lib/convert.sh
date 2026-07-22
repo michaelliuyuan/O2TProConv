@@ -982,7 +982,7 @@ _nested_blocks() {
 #   自定义异常 CONDITION / RAISE_APPLICATION_ERROR 未覆盖（标 known-limitation）。
 _restructure() {
   awk '
-    BEGIN { state="pre"; IGNORECASE=1; ltop=0; labeln=0; has_ndf=0; has_others=0; done_needed=0; in_cursor=0; block_depth=0; nested_decl_buf=""; verrmsg_var="v_errmsg"; _seen_done=0; _seen_verrmsg=0; custom_exc_body="" }
+    BEGIN { state="pre"; IGNORECASE=1; ltop=0; labeln=0; has_ndf=0; has_others=0; done_needed=0; in_cursor=0; block_depth=0; nested_decl_buf=""; done_var="done"; verrmsg_var="v_errmsg"; _seen_done=0; _seen_verrmsg=0; custom_exc_body="" }
     function newlabel(){ labeln++; return "lp" labeln }
     function is_as_is_line(line) {
       return (line ~ /^[ \t]*(AS|IS)[ \t]*$/) || (line ~ /[)A-Za-z0-9_][ \t]+(AS|IS)[ \t]*$/)
@@ -1040,13 +1040,6 @@ _restructure() {
       if (has_others)  h = h "    DECLARE EXIT HANDLER FOR SQLEXCEPTION\n    BEGIN\n        GET DIAGNOSTICS CONDITION 1 " err_var " = MESSAGE_TEXT;\n" others_body "    END;\n"
       if (h != "") printf "%s", h
       if (custom_exc_body != "") printf "%s", custom_exc_body
-      # P0-2：若标识符碰撞，bodybuf 中 _restructure 生成的 done/v_errmsg 引用也需同步改名
-      if (done_var != "done") gsub(/\<done\>/, done_var, bodybuf)
-      if (err_var != "v_errmsg") {
-        gsub(/\<v_errmsg\>/, err_var, bodybuf)
-        gsub(/\<v_errmsg\>/, err_var, ndf_body)
-        gsub(/\<v_errmsg\>/, err_var, others_body)
-      }
       if (bodybuf != "") printf "%s", bodybuf
       print "END"
     }
@@ -1067,6 +1060,7 @@ _restructure() {
         if (in_cursor) { curbuf=(curbuf==""?"":curbuf "\n") line; if (line ~ /;[ \t]*$/) in_cursor=0; next }
         if (line ~ /^[ \t]*CURSOR[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IS/) {
           done_needed=1
+          if (_seen_done) done_var = "done_o2t"
           core=line; sub(/^[ \t]+/,"",core); sub(/^CURSOR[ \t]+/,"",core); cname=core; sub(/[ \t]+IS.*$/,"",cname)
           rest=line; sub(/^[ \t]*CURSOR[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IS/,"",rest)
           dline = "    DECLARE " cname " CURSOR FOR" (rest ~ /^[ \t]*$/ ? "" : rest)
@@ -1151,11 +1145,12 @@ _restructure() {
         sub(/^[A-Za-z_][A-Za-z0-9_]*[ \t]+IN[ \t]+/,"",core)                           # core = "cursor_name LOOP"
         cname=core; sub(/[ \t]+LOOP[ \t]*$/,"",cname)
         done_needed=1
+        if (_seen_done) done_var = "done_o2t"
         lbl=newlabel(); ltop++; ltype[ltop]="CFOR"; llabel[ltop]=lbl; lvar[ltop]=fvar; lcursor[ltop]=cname
         bodybuf=bodybuf ind "OPEN " cname ";\n"
         bodybuf=bodybuf ind lbl ": LOOP\n"
         bodybuf=bodybuf ind "    FETCH " cname " INTO " fvar "; -- TODO(需人工转换): MySQL 无 RECORD 类型，须展开为标量变量列表（按游标 SELECT 列序）\n"
-        bodybuf=bodybuf ind "    IF done = 1 THEN LEAVE " lbl ";\n" ind "    END IF;\n"; next
+        bodybuf=bodybuf ind "    IF " done_var " = 1 THEN LEAVE " lbl ";\n" ind "    END IF;\n"; next
       }
       if (line ~ /^[ \t]*FOR[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IN[ \t]+REVERSE[ \t]+[0-9]+[ \t]*\.\.[ \t]*[^ \t]+[ \t]+LOOP[ \t]*$/) {
         # REVERSE FOR v IN REVERSE lo..hi LOOP → lbl: WHILE v >= lo DO（计数器 v 初始化=hi，递减）
@@ -1203,7 +1198,7 @@ _restructure() {
         ind=getindent(line); core=line; sub(/^[ \t]*EXIT[ \t]+WHEN[ \t]+/,"",core); sub(/;[ \t]*$/,"",core)
         # 替换所有 cursor_name%NOTFOUND → done = 1
         while (match(core, /[A-Za-z_][A-Za-z0-9_]*%NOTFOUND/)) {
-          core = substr(core,1,RSTART-1) "done = 1" substr(core,RSTART+RLENGTH)
+          core = substr(core,1,RSTART-1) done_var " = 1" substr(core,RSTART+RLENGTH)
         }
         cond=core
         lbl=(ltop>0?llabel[ltop]:"lp1")
