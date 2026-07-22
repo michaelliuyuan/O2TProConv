@@ -982,7 +982,7 @@ _nested_blocks() {
 #   自定义异常 CONDITION / RAISE_APPLICATION_ERROR 未覆盖（标 known-limitation）。
 _restructure() {
   awk '
-    BEGIN { state="pre"; IGNORECASE=1; ltop=0; labeln=0; has_ndf=0; has_others=0; done_needed=0; in_cursor=0; block_depth=0; nested_decl_buf=""; verrmsg_var="v_errmsg" }
+    BEGIN { state="pre"; IGNORECASE=1; ltop=0; labeln=0; has_ndf=0; has_others=0; done_needed=0; in_cursor=0; block_depth=0; nested_decl_buf=""; verrmsg_var="v_errmsg"; _seen_done=0; _seen_verrmsg=0; custom_exc_body="" }
     function newlabel(){ labeln++; return "lp" labeln }
     function is_as_is_line(line) {
       return (line ~ /^[ \t]*(AS|IS)[ \t]*$/) || (line ~ /[)A-Za-z0-9_][ \t]+(AS|IS)[ \t]*$/)
@@ -1039,6 +1039,7 @@ _restructure() {
       if (has_ndf)     h = h "    DECLARE EXIT HANDLER FOR NOT FOUND\n    BEGIN\n" ndf_body "    END;\n"
       if (has_others)  h = h "    DECLARE EXIT HANDLER FOR SQLEXCEPTION\n    BEGIN\n        GET DIAGNOSTICS CONDITION 1 " err_var " = MESSAGE_TEXT;\n" others_body "    END;\n"
       if (h != "") printf "%s", h
+      if (custom_exc_body != "") printf "%s", custom_exc_body
       # P0-2：若标识符碰撞，bodybuf 中 _restructure 生成的 done/v_errmsg 引用也需同步改名
       if (done_var != "done") gsub(/\<done\>/, done_var, bodybuf)
       if (err_var != "v_errmsg") {
@@ -1105,12 +1106,12 @@ _restructure() {
       if (state=="exception") {
         if (line ~ /^[ \t]*WHEN[ \t]+OTHERS[ \t]+THEN/)        { exc_curr="others"; has_others=1; if (_seen_verrmsg) verrmsg_var = "v_errmsg_o2t"; next }
         if (line ~ /^[ \t]*WHEN[ \t]+NO_DATA_FOUND[ \t]+THEN/) { exc_curr="ndf";    has_ndf=1;     next }
-        if (line ~ /^[ \t]*WHEN[ \t]+/)                         { exc_curr="other"; has_others=1; if (_seen_verrmsg) verrmsg_var = "v_errmsg_o2t"; others_body = others_body "-- TODO(需人工转换): 自定义异常分支需人工创建 DECLARE CONDITION + 独立 EXIT HANDLER，原 body 已注释化保留\n"; next }
+        if (line ~ /^[ \t]*WHEN[ \t]+/)                         { exc_curr="other"; custom_exc_body = custom_exc_body "-- TODO(需人工转换): 自定义异常分支需人工创建 DECLARE CONDITION + 独立 EXIT HANDLER，原 body 已注释化保留\n"; next }
         if (is_sp_end(line)) { assemble(); state="end"; next }
         l=conv_assign(line); gsub(/SQLERRM/, verrmsg_var, l)
         if (exc_curr=="ndf")         ndf_body    = (ndf_body==""?"":ndf_body)    l "\n"
         else if (exc_curr=="others") others_body = (others_body==""?"":others_body) l "\n"
-        else if (exc_curr=="other")  others_body = others_body "-- " line "\n"
+        else if (exc_curr=="other")  custom_exc_body = custom_exc_body "-- " line "\n"
         next
       }
       # state == body
