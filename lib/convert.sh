@@ -180,11 +180,11 @@ _split_package_body() {
   local pkg_file="$1" tmpdir="$2" prefix="$3"
   local sp_list=""
   awk -v tmpdir="$tmpdir" -v prefix="$prefix" '
-    BEGIN { IGNORECASE=1; in_sp=0; sp_name=""; sp_type=""; sp_lines=0; sp_count=0; in_pkg_decls=1; pkg_decls_lines=0 }
+    BEGIN { IGNORECASE=1; in_sp=0; sp_name=""; sp_type=""; sp_lines=0; sp_count=0; in_pkg_decls=1; pkg_decls_lines=0; flushed=0 }
     /^[ \t]*--/ { if (in_sp) sp_buf[sp_lines++] = $0; else if (in_pkg_decls) pkg_decls[pkg_decls_lines++] = $0; next }
     /^[ \t]*PROCEDURE[ \t]+[A-Za-z_][A-Za-z0-9_]*/ || /^[ \t]*FUNCTION[ \t]+[A-Za-z_][A-Za-z0-9_]*/ {
       if (in_sp) { flush_sp() }
-      in_sp=1; in_pkg_decls=0; sp_lines=0
+      in_sp=1; in_pkg_decls=0; sp_lines=0; flushed=0
       if ($0 ~ /^[ \t]*PROCEDURE/) sp_type="PROCEDURE"
       else sp_type="FUNCTION"
       sp_name=$0; sub(/^[ \t]*(PROCEDURE|FUNCTION)[ \t]+/,"",sp_name); sub(/[ \t(;].*$/,"",sp_name)
@@ -995,7 +995,7 @@ _nested_blocks() {
 #   自定义异常 CONDITION / RAISE_APPLICATION_ERROR 未覆盖（标 known-limitation）。
 _restructure() {
   awk '
-    BEGIN { state="pre"; IGNORECASE=1; ltop=0; labeln=0; has_ndf=0; has_others=0; done_needed=0; in_cursor=0; block_depth=0; nested_decl_buf=""; done_var="done"; verrmsg_var="v_errmsg"; _seen_done=0; _seen_verrmsg=0; custom_exc_body="" }
+    BEGIN { state="pre"; IGNORECASE=1; ltop=0; labeln=0; has_ndf=0; has_others=0; done_needed=0; in_cursor=0; block_depth=0; nested_decl_buf=""; done_var="done"; verrmsg_var="v_errmsg"; _seen_done=0; _seen_verrmsg=0; custom_exc_body=""; inline_cursor_n=0 }
     function newlabel(){ labeln++; return "lp" labeln }
     function is_as_is_line(line) {
       return (line ~ /^[ \t]*(AS|IS)[ \t]*$/) || (line ~ /[)A-Za-z0-9_][ \t]+(AS|IS)[ \t]*$/)
@@ -1031,15 +1031,20 @@ _restructure() {
       n = split(cols, col_arr, ",")
       cursor_cols[cname] = ""
       for (i = 1; i <= n; i++) {
-        col = col_arr[i]; gsub(/^[ \t]+|[ \t]+$/, "", col)
+        col = col_arr[i]; gsub(/[\r\n]/, "", col); gsub(/^[ \t]+|[ \t]+$/, "", col)
         if (col == "*") { cursor_cols[cname] = ""; return }  # SELECT * 无法展开
         alias = ""
-        # 取 AS alias 或末尾别名
+        # 取 AS alias 或末尾别名（Major #3 fix: 从匹配文本提取别名）
         if (match(toupper(col), /[ \t]+AS[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*$/)) {
-          alias = substr(col, RSTART + RLENGTH); gsub(/^[ \t]+|[ \t]+$/, "", alias)
+          # RSTART..RLENGTH 从 " AS alias" 开始；从 RSTART+RLENGTH 往回提取标识符
+          alias = substr(col, RSTART)
+          gsub(/^[ \t]+AS[ \t]+/, "", alias)
+          gsub(/[ \t]+$/, "", alias)
         } else if (match(col, /[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*$/)) {
-          alias = substr(col, RSTART + RLENGTH); gsub(/^[ \t]+|[ \t]+$/, "", alias)
-          if (alias ~ /^(FROM|WHERE|JOIN|ON|GROUP|ORDER|HAVING|UNION|AND|OR|NOT|IN|IS|NULL|TRUE|FALSE)$/i) alias = ""
+          alias = substr(col, RSTART)
+          gsub(/^[ \t]+/, "", alias)
+          gsub(/[ \t]+$/, "", alias)
+          if (toupper(alias) ~ /^(FROM|WHERE|JOIN|ON|GROUP|ORDER|HAVING|UNION|AND|OR|NOT|IN|IS|NULL|TRUE|FALSE)$/) alias = ""
         }
         if (alias != "") col = alias
         else { sub(/^.*\./, "", col) }
@@ -1075,6 +1080,30 @@ _restructure() {
       }
       if (done_needed)   printf "    DECLARE %s INT DEFAULT 0;\n", done_var
       if (has_others)    printf "    DECLARE %s VARCHAR(255);\n", err_var
+      # P1-a Critical #1 fix: 游标 FOR 展开变量必须在游标 DECLARE 之前声明
+      # 先做 rec.column → v_column 替换，再注入 DECLARE
+      split("", _cursor_declared)
+      for (_rvar in cursor_rec_map) {
+        _cname = cursor_rec_map[_rvar]
+        if (_cname in cursor_cols && cursor_cols[_cname] != "") {
+          _n = split(cursor_cols[_cname], _cc, ",")
+          for (_j = 1; _j <= _n; _j++) {
+            _cn = _cc[_j]; gsub(/^[ \t]+|[ \t]+$/, "", _cn)
+            _vname = "v_" _cn
+            _pat = _rvar "\\." _cn
+            _repl = _vname
+            gsub(_pat, _repl, bodybuf)
+            gsub(_pat, _repl, ndf_body)
+            gsub(_pat, _repl, others_body)
+            if (!(_vname in _seen) && !(_vname in _cursor_declared)) {
+              _cursor_declared[_vname] = 1
+            }
+          }
+        }
+      }
+      for (_dv in _cursor_declared) {
+        printf "    DECLARE %s VARCHAR(4000); -- TODO(需人工核对类型): 游标 FOR 展开变量\n", _dv
+      }
       if (curbuf != "")  printf "%s\n", curbuf
       h=""
       if (done_needed) h = h "    DECLARE CONTINUE HANDLER FOR NOT FOUND SET " done_var " = 1;\n"
@@ -1082,21 +1111,6 @@ _restructure() {
       if (has_others)  h = h "    DECLARE EXIT HANDLER FOR SQLEXCEPTION\n    BEGIN\n        GET DIAGNOSTICS CONDITION 1 " err_var " = MESSAGE_TEXT;\n" others_body "    END;\n"
       if (h != "") printf "%s", h
       if (custom_exc_body != "") printf "%s", custom_exc_body
-      # P1-a：自动展开游标 FOR 的 rec.column → v_column 引用
-      for (_rvar in cursor_rec_map) {
-        _cname = cursor_rec_map[_rvar]
-        if (_cname in cursor_cols && cursor_cols[_cname] != "") {
-          _n = split(cursor_cols[_cname], _cc, ",")
-          for (_j = 1; _j <= _n; _j++) {
-            _cn = _cc[_j]; gsub(/^[ \t]+|[ \t]+$/, "", _cn)
-            _pat = _rvar "\\." _cn
-            _repl = "v_" _cn
-            gsub(_pat, _repl, bodybuf)
-            gsub(_pat, _repl, ndf_body)
-            gsub(_pat, _repl, others_body)
-          }
-        }
-      }
       if (bodybuf != "") printf "%s", bodybuf
       print "END"
     }
@@ -1255,7 +1269,7 @@ _restructure() {
         inline_select=core
         # 解析列名
         _parse_cursor_cols("_inline_" fvar, inline_select)
-        _icname = "_cur_" fvar
+        _icname = "_cur_" fvar "_" (inline_cursor_n++)
         # 生成游标声明（放入 curbuf → assemble 时输出到 DECLARE 段）
         curbuf=(curbuf==""?"":curbuf "\n") "    DECLARE " _icname " CURSOR FOR " inline_select ";"
         done_needed=1
@@ -1374,9 +1388,19 @@ _restructure() {
         bodybuf=bodybuf ind "PREPARE stmt FROM @sql;\n"
         if (has_into) {
           # P1-b：单变量 INTO → EXECUTE stmt INTO var [USING ...]（MySQL 8.0+）；多变量 → 游标 FETCH 框架
+          # Critical #2 fix: EXECUTE...INTO 仅接受 local DECLARE 变量或 @user 变量，不接受 SP 参数。
+          # 解决：对每个 INTO 目标用 @o2t_<var> 临时变量接收，再 SET 回原变量。
           _n_into = split(into_vars, _into_arr, /,[ \t]*/)
           if (_n_into == 1) {
-            bodybuf=bodybuf ind "EXECUTE stmt INTO " into_vars exec_suffix ";\n"
+            _into_var = _into_arr[1]; gsub(/^[ \t]+|[ \t]+$/, "", _into_var)
+            # SP 参数(IN/OUT/INOUT) 或非 @ 开头 → 需通过 @user 变量中转
+            if (_into_var !~ /^@/) {
+              _tmp_var = "@o2t_into_" _into_var
+              bodybuf=bodybuf ind "EXECUTE stmt INTO " _tmp_var exec_suffix ";\n"
+              bodybuf=bodybuf ind "SET " _into_var " = " _tmp_var ";\n"
+            } else {
+              bodybuf=bodybuf ind "EXECUTE stmt INTO " _into_var exec_suffix ";\n"
+            }
           } else {
             bodybuf=bodybuf ind "-- TODO(需人工转换): EXECUTE IMMEDIATE INTO " into_vars " 多变量需改 DECLARE+OPEN/FETCH 游标\n"
             bodybuf=bodybuf ind "EXECUTE stmt" exec_suffix ";\n"
