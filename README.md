@@ -394,7 +394,7 @@ DELIMITER ;
 - [x] P0-1：自定义异常 `WHEN <custom_exception>` 分支静默丢弃修复（`68a57be` / `e7ea543`）
 - [x] P0-2：标识符碰撞 gsub 过度替换修复（`68a57be` / `0aa08da`）
 - [x] P0-3：LISTAGG 跨行漏检修复 — `_mark_complex` 新增 `prev_line` 跨行跟踪（`68a57be` / `5a12df3`）
-- [ ] deferred：LISTAGG OVER 跨行兜底检测
+- [x] P0 回归验证通过（基线 27 SP 零回归 + 6 P0 专项 SP 通过）— `0aa08da`
 
 ## 常见问题（FAQ）
 
