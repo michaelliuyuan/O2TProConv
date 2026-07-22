@@ -61,7 +61,7 @@ run_convert() {
 
     # PACKAGE BODY 拆分：一个 PACKAGE_BODY 含多个 PROCEDURE/FUNCTION → 拆为独立文件分别转换
     if grep -qiE 'CREATE[[:space:]]+OR[[:space:]]+REPLACE[[:space:]]+PACKAGE[[:space:]]+BODY' "$f" 2>/dev/null; then
-      local pkg_sp_list; pkg_sp_list="$(_split_package_body "$f" "$tmpdir" "$base")"
+      local pkg_sp_list; pkg_sp_list="$(_split_package_body "$f" "$tmpdir" "$base" | tr ' ' '\n' | sort -u | tr '\n' ' ')"
       if [[ -n "$pkg_sp_list" ]]; then
         local pkg_sp pkg_base pkg_out pkg_todos
         for pkg_sp in $pkg_sp_list; do
@@ -180,11 +180,11 @@ _split_package_body() {
   local pkg_file="$1" tmpdir="$2" prefix="$3"
   local sp_list=""
   awk -v tmpdir="$tmpdir" -v prefix="$prefix" '
-    BEGIN { IGNORECASE=1; in_sp=0; sp_name=""; sp_type=""; sp_lines=0; sp_count=0 }
-    /^[ \t]*--/ { if (in_sp) sp_buf[sp_lines++] = $0; next }
+    BEGIN { IGNORECASE=1; in_sp=0; sp_name=""; sp_type=""; sp_lines=0; sp_count=0; in_pkg_decls=1; pkg_decls_lines=0 }
+    /^[ \t]*--/ { if (in_sp) sp_buf[sp_lines++] = $0; else if (in_pkg_decls) pkg_decls[pkg_decls_lines++] = $0; next }
     /^[ \t]*PROCEDURE[ \t]+[A-Za-z_][A-Za-z0-9_]*/ || /^[ \t]*FUNCTION[ \t]+[A-Za-z_][A-Za-z0-9_]*/ {
       if (in_sp) { flush_sp() }
-      in_sp=1; sp_lines=0
+      in_sp=1; in_pkg_decls=0; sp_lines=0
       if ($0 ~ /^[ \t]*PROCEDURE/) sp_type="PROCEDURE"
       else sp_type="FUNCTION"
       sp_name=$0; sub(/^[ \t]*(PROCEDURE|FUNCTION)[ \t]+/,"",sp_name); sub(/[ \t(;].*$/,"",sp_name)
@@ -195,6 +195,14 @@ _split_package_body() {
     }
     {
       if (in_sp) sp_buf[sp_lines++] = $0
+      else if (in_pkg_decls && $0 !~ /^[ \t]*$/ \
+               && $0 !~ /^[ \t]*CREATE[ \t]/ \
+               && $0 !~ /^[ \t]*END[ \t]/ \
+               && $0 !~ /^[ \t]*\/[ \t]*$/ \
+               && $0 !~ /^[ \t]*AS[ \t]*$/ \
+               && $0 !~ /^[ \t]*IS[ \t]*$/) {
+        pkg_decls[pkg_decls_lines++] = $0
+      }
       # 检测子程序结束：END 后跟**当前子程序名**或单独分号（非 END IF/LOOP/CASE）
       # Bug #4 修复：原正则匹配任意 END <name>; 会误匹配 PACKAGE BODY 的 END <pkg_name>;
       # → 子程序 buffer 含 pkg END → flush_sp 输出含多余内容；END{} 再 flush → 重复
@@ -212,13 +220,18 @@ _split_package_body() {
     function flush_sp(   fname, i) {
       if (!in_sp || sp_lines == 0) return
       fname = tmpdir "/" prefix "_" sp_name ".sql"
+      # P1-c：PACKAGE 级声明注入到每个子程序头部
+      if (pkg_decls_lines > 0) {
+        for (i=0; i<pkg_decls_lines; i++) print pkg_decls[i] > fname
+        print "-- ^^^ PACKAGE 级声明(变量/类型/游标)已注入; 全局状态(跨子程序共享)不支持, 需人工核对" > fname
+      }
       for (i=0; i<sp_lines; i++) print sp_buf[i] > fname
       close(fname)
       printf "%s ", fname
-      sp_count++
+      sp_count++; flushed=1
       in_sp=0; sp_lines=0
     }
-    END { if (in_sp) flush_sp() }
+    END { if (in_sp && !flushed) flush_sp() }
   ' "$pkg_file"
   printf '%s' "$sp_list"
 }
@@ -1005,6 +1018,35 @@ _restructure() {
     function conv_assign(line) {
       return gensub(/^([ \t]*)([A-Za-z_][A-Za-z0-9_.]*)[ \t]*:=[ \t]*/, "\\1SET \\2 = ", "g", line)
     }
+    # 解析游标 SELECT 列名，存入 cursor_cols[cur_name] = "col1, col2, ..."
+    # 取 SELECT 和 FROM 之间的列列表，按逗号拆分，优先取别名否则取列名
+    function _parse_cursor_cols(cname, text,    sel_start, sel_end, cols, n, i, col, alias, rest) {
+      rest = text
+      if (!match(toupper(rest), /SELECT[ \t]+/)) return
+      sel_start = RSTART + RLENGTH
+      rest = substr(rest, sel_start)
+      if (!match(toupper(rest), /[ \t]+FROM[ \t]+/)) return
+      sel_end = RSTART - 1
+      cols = substr(rest, 1, sel_end)
+      n = split(cols, col_arr, ",")
+      cursor_cols[cname] = ""
+      for (i = 1; i <= n; i++) {
+        col = col_arr[i]; gsub(/^[ \t]+|[ \t]+$/, "", col)
+        if (col == "*") { cursor_cols[cname] = ""; return }  # SELECT * 无法展开
+        alias = ""
+        # 取 AS alias 或末尾别名
+        if (match(toupper(col), /[ \t]+AS[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*$/)) {
+          alias = substr(col, RSTART + RLENGTH); gsub(/^[ \t]+|[ \t]+$/, "", alias)
+        } else if (match(col, /[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*$/)) {
+          alias = substr(col, RSTART + RLENGTH); gsub(/^[ \t]+|[ \t]+$/, "", alias)
+          if (alias ~ /^(FROM|WHERE|JOIN|ON|GROUP|ORDER|HAVING|UNION|AND|OR|NOT|IN|IS|NULL|TRUE|FALSE)$/i) alias = ""
+        }
+        if (alias != "") col = alias
+        else { sub(/^.*\./, "", col) }
+        if (i > 1) cursor_cols[cname] = cursor_cols[cname] ", "
+        cursor_cols[cname] = cursor_cols[cname] col
+      }
+    }
     # 组装：header(DROP+CREATE+params) → BEGIN → 变量(+done/v_errmsg) → 游标 → handler → body → END
     function assemble(    h, vn, vl, i, vline, vname, _seen, _k, done_var, err_var) {
       printf "%s", hdrbuf
@@ -1040,6 +1082,21 @@ _restructure() {
       if (has_others)  h = h "    DECLARE EXIT HANDLER FOR SQLEXCEPTION\n    BEGIN\n        GET DIAGNOSTICS CONDITION 1 " err_var " = MESSAGE_TEXT;\n" others_body "    END;\n"
       if (h != "") printf "%s", h
       if (custom_exc_body != "") printf "%s", custom_exc_body
+      # P1-a：自动展开游标 FOR 的 rec.column → v_column 引用
+      for (_rvar in cursor_rec_map) {
+        _cname = cursor_rec_map[_rvar]
+        if (_cname in cursor_cols && cursor_cols[_cname] != "") {
+          _n = split(cursor_cols[_cname], _cc, ",")
+          for (_j = 1; _j <= _n; _j++) {
+            _cn = _cc[_j]; gsub(/^[ \t]+|[ \t]+$/, "", _cn)
+            _pat = _rvar "\\." _cn
+            _repl = "v_" _cn
+            gsub(_pat, _repl, bodybuf)
+            gsub(_pat, _repl, ndf_body)
+            gsub(_pat, _repl, others_body)
+          }
+        }
+      }
       if (bodybuf != "") printf "%s", bodybuf
       print "END"
     }
@@ -1057,7 +1114,12 @@ _restructure() {
         next
       }
       if (state=="decls") {
-        if (in_cursor) { curbuf=(curbuf==""?"":curbuf "\n") line; if (line ~ /;[ \t]*$/) in_cursor=0; next }
+        if (in_cursor) {
+          curbuf=(curbuf==""?"":curbuf "\n") line
+          if (line ~ /;[ \t]*$/) { in_cursor=0; _parse_cursor_cols(cursor_buf_name, cursor_buf_raw); cursor_buf_raw="" }
+          else cursor_buf_raw = cursor_buf_raw "\n" line
+          next
+        }
         if (line ~ /^[ \t]*CURSOR[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IS/) {
           done_needed=1
           if (_seen_done) done_var = "done_o2t"
@@ -1065,7 +1127,10 @@ _restructure() {
           rest=line; sub(/^[ \t]*CURSOR[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IS/,"",rest)
           dline = "    DECLARE " cname " CURSOR FOR" (rest ~ /^[ \t]*$/ ? "" : rest)
           curbuf=(curbuf==""?"":curbuf "\n") dline
+          cursor_buf_raw = rest
+          cursor_buf_name = cname
           if (line !~ /;[ \t]*$/) in_cursor=1
+          else _parse_cursor_cols(cname, cursor_buf_raw)
           next
         }
         if (line ~ /^[ \t]*BEGIN[ \t]*$/) { state="body"; next }            # BEGIN 在 assemble() 里发
@@ -1149,7 +1214,20 @@ _restructure() {
         lbl=newlabel(); ltop++; ltype[ltop]="CFOR"; llabel[ltop]=lbl; lvar[ltop]=fvar; lcursor[ltop]=cname
         bodybuf=bodybuf ind "OPEN " cname ";\n"
         bodybuf=bodybuf ind lbl ": LOOP\n"
-        bodybuf=bodybuf ind "    FETCH " cname " INTO " fvar "; -- TODO(需人工转换): MySQL 无 RECORD 类型，须展开为标量变量列表（按游标 SELECT 列序）\n"
+        # P1-a：若有游标列映射，自动展开 FETCH INTO 标量变量列表
+        if (cname in cursor_cols && cursor_cols[cname] != "") {
+          _cfetch_cols = cursor_cols[cname]
+          _cfetch_vars = ""
+          _n = split(_cfetch_cols, _cc, ",")
+          for (_j = 1; _j <= _n; _j++) {
+            _cn = _cc[_j]; gsub(/^[ \t]+|[ \t]+$/, "", _cn)
+            if (_j > 1) _cfetch_vars = _cfetch_vars ", "
+            _cfetch_vars = _cfetch_vars "v_" _cn
+          }
+          bodybuf=bodybuf ind "    FETCH " cname " INTO " _cfetch_vars ";\n"
+          cursor_rec_map[fvar] = cname
+        } else
+          bodybuf=bodybuf ind "    FETCH " cname " INTO " fvar "; -- TODO(需人工转换): MySQL 无 RECORD 类型，须展开为标量变量列表（按游标 SELECT 列序）\n"
         bodybuf=bodybuf ind "    IF " done_var " = 1 THEN LEAVE " lbl ";\n" ind "    END IF;\n"; next
       }
       if (line ~ /^[ \t]*FOR[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IN[ \t]+REVERSE[ \t]+[0-9]+[ \t]*\.\.[ \t]*[^ \t]+[ \t]+LOOP[ \t]*$/) {
@@ -1165,6 +1243,40 @@ _restructure() {
       }
       if (line ~ /^[ \t]*FOR[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IN[ \t]+REVERSE[ \t]+/) {       # REVERSE FOR 非数值范围 → TODO
         bodybuf=bodybuf line "\t-- TODO(需人工转换): REVERSE FOR..IN 需改 WHILE 递减（hi→lo）\n"; next
+      }
+      # P1-a：内联游标 FOR rec IN (SELECT ...) LOOP → 生成 DECLARE CURSOR + OPEN/FETCH/CLOSE
+      if (line ~ /^[ \t]*FOR[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IN[ \t]+\(/) {
+        ind=getindent(line); core=substr(line,length(ind)+1)
+        sub(/^FOR[ \t]+/,"",core); fvar=core; sub(/[ \t]+IN.*$/,"",fvar)
+        sub(/^[A-Za-z_][A-Za-z0-9_]*[ \t]+IN[ \t]+/,"",core)
+        # core = "(SELECT ...) LOOP"
+        # 提取括号内 SELECT 语句
+        sub(/^\(/,"",core); sub(/\)[ \t]*LOOP[ \t]*$/,"",core)
+        inline_select=core
+        # 解析列名
+        _parse_cursor_cols("_inline_" fvar, inline_select)
+        _icname = "_cur_" fvar
+        # 生成游标声明（放入 curbuf → assemble 时输出到 DECLARE 段）
+        curbuf=(curbuf==""?"":curbuf "\n") "    DECLARE " _icname " CURSOR FOR " inline_select ";"
+        done_needed=1
+        if (_seen_done) done_var = "done_o2t"
+        lbl=newlabel(); ltop++; ltype[ltop]="CFOR"; llabel[ltop]=lbl; lvar[ltop]=fvar; lcursor[ltop]=_icname
+        bodybuf=bodybuf ind "OPEN " _icname ";\n"
+        bodybuf=bodybuf ind lbl ": LOOP\n"
+        if ("_inline_" fvar in cursor_cols && cursor_cols["_inline_" fvar] != "") {
+          _cfetch_cols = cursor_cols["_inline_" fvar]
+          _cfetch_vars = ""
+          _n = split(_cfetch_cols, _cc, ",")
+          for (_j = 1; _j <= _n; _j++) {
+            _cn = _cc[_j]; gsub(/^[ \t]+|[ \t]+$/, "", _cn)
+            if (_j > 1) _cfetch_vars = _cfetch_vars ", "
+            _cfetch_vars = _cfetch_vars "v_" _cn
+          }
+          bodybuf=bodybuf ind "    FETCH " _icname " INTO " _cfetch_vars ";\n"
+          cursor_rec_map[fvar] = "_inline_" fvar
+        } else
+          bodybuf=bodybuf ind "    FETCH " _icname " INTO " fvar "; -- TODO(需人工转换): 内联游标 SELECT * 或复杂列无法自动展开\n"
+        bodybuf=bodybuf ind "    IF " done_var " = 1 THEN LEAVE " lbl ";\n" ind "    END IF;\n"; next
       }
       if (line ~ /^[ \t]*FOR[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IN[ \t]+/) {       # 其他 FOR..IN（无法识别）→ TODO
         bodybuf=bodybuf line "\t-- TODO(需人工转换): FOR..IN 需改 DECLARE CURSOR+LOOP/FETCH 或反向计数\n"; next
@@ -1245,8 +1357,9 @@ _restructure() {
           sql_expr = substr(sql_expr, 1, i_idx)
         } else {
           # 也检查非引号结尾的 INTO（如 EXECUTE IMMEDIATE v_sql INTO x）
+          # 模式 [ \t]INTO[ \t]+ 已保证 INTO 前后有空格（词边界），无需额外守卫
           i_idx = match(sql_expr, /[ \t]INTO[ \t]+/)
-          if (i_idx > 0 && substr(sql_expr, i_idx-1, 1) !~ /[A-Za-z0-9_]/) {
+          if (i_idx > 0) {
             into_vars = substr(sql_expr, i_idx + 1)
             sub(/^[ \t]*INTO[ \t]+/,"",into_vars)
             sql_expr = substr(sql_expr, 1, i_idx - 1)
@@ -1260,10 +1373,17 @@ _restructure() {
         bodybuf=bodybuf ind "SET @sql = " sql_expr ";\n"
         bodybuf=bodybuf ind "PREPARE stmt FROM @sql;\n"
         if (has_into) {
-          # INTO TODO 独立行（须行首 -- TODO 格式，_collect_todos 才能收集进报告）
-          bodybuf=bodybuf ind "-- TODO(需人工转换): EXECUTE IMMEDIATE INTO " into_vars " MySQL PREPARE 无单行 SELECT 返回对应，需改 DECLARE+OPEN/FETCH 游标\n"
+          # P1-b：单变量 INTO → EXECUTE stmt INTO var [USING ...]（MySQL 8.0+）；多变量 → 游标 FETCH 框架
+          _n_into = split(into_vars, _into_arr, /,[ \t]*/)
+          if (_n_into == 1) {
+            bodybuf=bodybuf ind "EXECUTE stmt INTO " into_vars exec_suffix ";\n"
+          } else {
+            bodybuf=bodybuf ind "-- TODO(需人工转换): EXECUTE IMMEDIATE INTO " into_vars " 多变量需改 DECLARE+OPEN/FETCH 游标\n"
+            bodybuf=bodybuf ind "EXECUTE stmt" exec_suffix ";\n"
+          }
+        } else {
+          bodybuf=bodybuf ind "EXECUTE stmt" exec_suffix ";\n"
         }
-        bodybuf=bodybuf ind "EXECUTE stmt" exec_suffix ";\n"
         bodybuf=bodybuf ind "DEALLOCATE PREPARE stmt;\n"; next
       }
       l=conv_assign(line); bodybuf=bodybuf l "\n"

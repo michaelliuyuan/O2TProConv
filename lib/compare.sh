@@ -195,9 +195,10 @@ _cmp_gen_oracle() {
   printf '%b' "$vars"; printf 'EXEC %s(%s);\n' "$sp" "$(IFS=','; printf '%s' "${callargs[*]}")"; printf '%b' "$prints"; printf 'EXIT;\n'
 }
 
-# 抓 TiDB SELECT 输出里的值（按列序，tab/换行分隔）→ 与 outexp 顺序对齐
-# 简化：取 SELECT 输出的非表头数据行，第一行按 tab 分列。
-_cmp_capture_tidb() { awk 'NR>1 && !/^[@a-zA-Z_]/ {print} /^[a-zA-Z_]/ {next}' | tail -n +1 | head -1; }
+# 抓 TiDB SELECT 输出里的值（按列序，tab 分隔 TSV 格式）→ 与 outexp 顺序对齐
+# 输入：mysql -B -N 输出的 TSV（\t 分隔列，\n 分隔行）
+# 参数：col=1-based 列号；row=行号（默认 1）
+_cmp_capture_tidb() { awk -F'\t' -v col="${1:-1}" -v row="${2:-1}" 'NR==row && NF>=col {print $col; exit}'; }
 
 run_exec() {
   : "${CASES_DIR:?compare 需 CASES_DIR（ora2tidb.conf）}"
