@@ -513,7 +513,8 @@ _convert_known_semantics() {
         pos=RSTART
         if(pos>1){ prev=substr(line,pos-1,1); if(prev~/[A-Za-z0-9_]/){ out=out substr(line,1,pos); line=substr(line,pos+1); continue } }
         cpos=pos+RLENGTH-1; epos=match_paren(line,cpos)
-        if(epos==0){ todo=todo "LISTAGG 跨行需人工 GROUP_CONCAT; "; out=out line; return out }
+        # 跨行 LISTAGG（括号不配对）→ 不在此处理，留 _mark_complex 统一检测
+        if(epos==0){ out=out substr(line,1,pos); line=substr(line,pos+1); continue }
         mid=substr(line,cpos+1,epos-cpos-1); n=split_topcomma(mid,A)
         if(n<1 || n>2){ out=out substr(line,1,epos); line=substr(line,epos+1); continue }
         expr=trim(A[1])
@@ -803,7 +804,14 @@ _mark_complex() {
   awk '
     function todo(msg){ print "-- TODO(需人工转换): " msg }
     {
-      if ($0 ~ /^[ \t]*--/) { print; next }      # 跳过注释行（不在注释里标 TODO）
+      if ($0 ~ /^[ \t]*--/) { print; prev_line=""; next }
+      # 跨行 LISTAGG 检测（conv_listagg 已删 epos==0 分支，跨行 LISTAGG 由此处统一标 TODO）
+      # 形态 1：当前行含 LISTAGG（括号不配对/跨行续行，conv_listagg 透传未处理）
+      if ($0 ~ /LISTAGG/)              todo("跨行 LISTAGG 需人工 GROUP_CONCAT")
+      # 形态 2：上一行含 LISTAGG，当前行才有 WITHIN GROUP（跨行续）
+      if (prev_line ~ /LISTAGG/ && $0 ~ /WITHIN[ \t]+GROUP/) todo("跨行 LISTAGG WITHIN GROUP 需人工 GROUP_CONCAT")
+      # 形态 3：上一行含 LISTAGG/GROUP_CONCAT，当前行才是 OVER (...)—分析函数形式 MySQL 不支持
+      if (prev_line ~ /(LISTAGG|GROUP_CONCAT)/ && $0 ~ /(^|[^A-Za-z0-9_])OVER[ \t]*\(/) todo("LISTAGG OVER(PARTITION BY) 分析函数 MySQL GROUP_CONCAT 不支持，需人工")
       # 注：原 re_emptyif（IFNULL(x,空串) 的 NVL(x,空串) 语义分歧告警）已移除——|| 忠实转换器会
       # 生成 IFNULL(op,'')，与 NVL(x,'') 文本同形、post-mechanical 无法区分，全量标记只会误报每一处
       # ||。NVL(x,'') 分歧属已知 niche 边缘，由文档记录、不在此标记。
@@ -822,6 +830,7 @@ _mark_complex() {
       # 注：EXCEPTION 块（WHEN NO_DATA_FOUND/OTHERS）/ 显式游标 CURSOR..IS / 数值 FOR..IN / 游标 FOR rec IN cur LOOP / REVERSE FOR
       # 现由 _restructure 自动转换（EXIT handler / DECLARE..CURSOR FOR + done / WHILE+计数器 / OPEN+FETCH+CLOSE / WHILE 递减）；
       # 非 REVERSE 数值范围外的 FOR..IN 在 _restructure 内单独标 TODO。此处不再标 FOR/EXCEPTION/CURSOR，避免残留假阳性。
+      prev_line = $0
       print
     }
   '
@@ -973,7 +982,7 @@ _nested_blocks() {
 #   自定义异常 CONDITION / RAISE_APPLICATION_ERROR 未覆盖（标 known-limitation）。
 _restructure() {
   awk '
-    BEGIN { state="pre"; IGNORECASE=1; ltop=0; labeln=0; has_ndf=0; has_others=0; done_needed=0; in_cursor=0; block_depth=0; nested_decl_buf="" }
+    BEGIN { state="pre"; IGNORECASE=1; ltop=0; labeln=0; has_ndf=0; has_others=0; done_needed=0; in_cursor=0; block_depth=0; nested_decl_buf=""; done_var="done"; verrmsg_var="v_errmsg"; _seen_done=0; _seen_verrmsg=0 }
     function newlabel(){ labeln++; return "lp" labeln }
     function is_as_is_line(line) {
       return (line ~ /^[ \t]*(AS|IS)[ \t]*$/) || (line ~ /[)A-Za-z0-9_][ \t]+(AS|IS)[ \t]*$/)
@@ -997,10 +1006,10 @@ _restructure() {
       return gensub(/^([ \t]*)([A-Za-z_][A-Za-z0-9_.]*)[ \t]*:=[ \t]*/, "\\1SET \\2 = ", "g", line)
     }
     # 组装：header(DROP+CREATE+params) → BEGIN → 变量(+done/v_errmsg) → 游标 → handler → body → END
-    function assemble(    h, vn, vl, i, vline, vname, _seen, _k) {
+    function assemble(    h, vn, vl, i, vline, vname, _seen, _k, done_var, err_var) {
       printf "%s", hdrbuf
       print "BEGIN"
-      # 收集 varbuf 中已声明的变量名，用于检测 FOR 计数器是否隐式声明
+      # 收集 varbuf 中已声明的变量名，用于检测 FOR 计数器是否隐式声明 + P0-2 碰撞检测
       split("", _seen)
       if (varbuf != "") {
         vn=split(varbuf, vl, "\n")
@@ -1015,18 +1024,28 @@ _restructure() {
           print vline
         }
       }
+      # P0-2：合成标识符碰撞检测——若用户已声明 done/v_errmsg，则用 _o2t 后缀避免冲突
+      done_var = (_seen["done"] ? "done_o2t" : "done")
+      err_var  = (_seen["v_errmsg"] ? "v_errmsg_o2t" : "v_errmsg")
       # 注入隐式声明的 FOR 计数器变量（Oracle FOR v IN lo..hi 中 v 未在 DECLARE 段显式声明）
       for (_k in for_lo) {
         if (!(_k in _seen)) printf "    DECLARE %s INT DEFAULT %s;\n", _k, for_lo[_k]
       }
-      if (done_needed)   print "    DECLARE done INT DEFAULT 0;"
-      if (has_others)    print "    DECLARE v_errmsg VARCHAR(255);"
+      if (done_needed)   printf "    DECLARE %s INT DEFAULT 0;\n", done_var
+      if (has_others)    printf "    DECLARE %s VARCHAR(255);\n", err_var
       if (curbuf != "")  printf "%s\n", curbuf
       h=""
-      if (done_needed) h = h "    DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;\n"
+      if (done_needed) h = h "    DECLARE CONTINUE HANDLER FOR NOT FOUND SET " done_var " = 1;\n"
       if (has_ndf)     h = h "    DECLARE EXIT HANDLER FOR NOT FOUND\n    BEGIN\n" ndf_body "    END;\n"
-      if (has_others)  h = h "    DECLARE EXIT HANDLER FOR SQLEXCEPTION\n    BEGIN\n        GET DIAGNOSTICS CONDITION 1 v_errmsg = MESSAGE_TEXT;\n" others_body "    END;\n"
+      if (has_others)  h = h "    DECLARE EXIT HANDLER FOR SQLEXCEPTION\n    BEGIN\n        GET DIAGNOSTICS CONDITION 1 " err_var " = MESSAGE_TEXT;\n" others_body "    END;\n"
       if (h != "") printf "%s", h
+      # P0-2：若标识符碰撞，bodybuf 中 _restructure 生成的 done/v_errmsg 引用也需同步改名
+      if (done_var != "done") gsub(/\<done\>/, done_var, bodybuf)
+      if (err_var != "v_errmsg") {
+        gsub(/\<v_errmsg\>/, err_var, bodybuf)
+        gsub(/\<v_errmsg\>/, err_var, ndf_body)
+        gsub(/\<v_errmsg\>/, err_var, others_body)
+      }
       if (bodybuf != "") printf "%s", bodybuf
       print "END"
     }
@@ -1047,6 +1066,7 @@ _restructure() {
         if (in_cursor) { curbuf=(curbuf==""?"":curbuf "\n") line; if (line ~ /;[ \t]*$/) in_cursor=0; next }
         if (line ~ /^[ \t]*CURSOR[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IS/) {
           done_needed=1
+          if (_seen_done) done_var = "done_o2t"
           core=line; sub(/^[ \t]+/,"",core); sub(/^CURSOR[ \t]+/,"",core); cname=core; sub(/[ \t]+IS.*$/,"",cname)
           rest=line; sub(/^[ \t]*CURSOR[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IS/,"",rest)
           dline = "    DECLARE " cname " CURSOR FOR" (rest ~ /^[ \t]*$/ ? "" : rest)
@@ -1082,11 +1102,12 @@ _restructure() {
       if (state=="exception") {
         if (line ~ /^[ \t]*WHEN[ \t]+OTHERS[ \t]+THEN/)        { exc_curr="others"; has_others=1; next }
         if (line ~ /^[ \t]*WHEN[ \t]+NO_DATA_FOUND[ \t]+THEN/) { exc_curr="ndf";    has_ndf=1;     next }
-        if (line ~ /^[ \t]*WHEN[ \t]+/)                         { exc_curr="other";   next }   # 自定义/其他异常（本批不细映射）
+        if (line ~ /^[ \t]*WHEN[ \t]+/)                         { exc_curr="other"; has_others=1; others_body = others_body "-- TODO(需人工转换): 自定义异常分支需人工创建 DECLARE CONDITION + 独立 EXIT HANDLER，原 body 已注释化保留\n"; next }
         if (is_sp_end(line)) { assemble(); state="end"; next }
         l=conv_assign(line); gsub(/SQLERRM/, "v_errmsg", l)
         if (exc_curr=="ndf")         ndf_body    = (ndf_body==""?"":ndf_body)    l "\n"
         else if (exc_curr=="others") others_body = (others_body==""?"":others_body) l "\n"
+        else if (exc_curr=="other")  others_body = others_body "-- " line "\n"
         next
       }
       # state == body
