@@ -301,8 +301,10 @@ DELIMITER ;
 | 结果一致性 | **两端 CALL 17/17 全绿**（Oracle 23ai Free `rocky237` vs TiDB v7.1.9 `rocky231`，13 SP / 17 用例，同 schema + 同入参，归一化后零 diff；覆盖 DECODE/NVL/`||`/EXCEPTION/显式游标（含复合 EXIT WHEN）/WHILE/FOR/REVERSE FOR/CONTINUE/INOUT/FUNCTION/ELSIF/TO_CHAR）✅ |
 | T3 标记 | `%ROWTYPE` / BULK COLLECT（含关联 TYPE 声明）/ EXECUTE IMMEDIATE INTO / 集合 / 内联游标 FOR 全标 TODO ✅；PACKAGE BODY 自动拆分+转换 |
 | 性能 | 报告产出 ✅ |
+| **P0 回归** | **P0-1/2/3 全部通过** ✅（基于 `0aa08da`）：P0-3 LISTAGG 跨行 3 种形态正确标记 TODO + 单行 GROUP_CONCAT 两端一致；P0-1 自定义异常分支注释化保留+标记 TODO；P0-2 标识符碰撞 gsub 修复后用户变量不误替换 + 两端 CALL 一致；基线 27 SP snapshot-diff 零回归 |
+| P0 新增 6 SP | 6 个 P0 专项测试 SP 转换 + 两端 CALL 验证通过 ✅ |
 
-> **历史基线**：M2 阶段单次连贯 33/33 @ `c9c2718`（Route A，11 SP：T1×16 + T2×17）。P1 功能扩展（`%TYPE`/游标 FOR/EXECUTE IMMEDIATE/LISTAGG/REVERSE FOR）+ Bug #1-6 修复后，当前基线为 33/33 CREATE + 17/17 两端 CALL 一致（基于 `42464c5`）。
+> **历史基线**：M2 阶段单次连贯 33/33 @ `c9c2718`（Route A，11 SP：T1×16 + T2×17）。P1 功能扩展（`%TYPE`/游标 FOR/EXECUTE IMMEDIATE/LISTAGG/REVERSE FOR）+ Bug #1-6 修复后，基线为 33/33 CREATE + 17/17 两端 CALL 一致（基于 `42464c5`）。P0 正确性修复（LISTAGG 跨行/自定义异常/标识符碰撞）后，基线升级为 `0aa08da`：27 基线 SP 零回归 + 6 P0 专项 SP 通过。
 
 **结构层转换逐条实证正确**（两端 CALL 验证）：EXCEPTION→EXIT handler（NOT_FOUND 分叉对）、显式游标（top3 + 复合 EXIT WHEN `done=1 OR v_count>=3`）、WHILE、FUNCTION/INOUT、NULL-`||` 忠实写法、DECODE-`<=>`（NULL-search 实证 `<=>` 必要）、数值 FOR（含 REVERSE FOR 递减）、CONTINUE（前置递增/递减防死循环）、`%TYPE` schema 内省解析、EXECUTE IMMEDIATE PREPARE/EXECUTE/DEALLOCATE、LISTAGG→GROUP_CONCAT。
 
@@ -329,6 +331,14 @@ DELIMITER ;
 | 5 | BULK COLLECT 关联 TYPE 声明未标 TODO（`_mark_complex` 未检测 `TYPE..IS TABLE OF/RECORD/VARRAY`） | `0283a44` |
 | 6 | EXIT WHEN 复合条件丢失（`%NOTFOUND` 整体替换为 `done=1`，丢弃 `OR` 条件） | `42464c5` |
 
+### P0 正确性 Bug 修复（P0 回归验证通过）
+
+| # | bug | 根因 | 修复 commit |
+|---|-----|------|-------------|
+| P0-1 | 自定义异常 `WHEN <custom_exception>` 分支静默丢弃 | `_restructure` 中 custom 分支 body 被误归入 `others_body`，仅 NDF/OTHERS 分支输出，custom 分支丢失 | `68a57be` / `e7ea543` |
+| P0-2 | 标识符碰撞 gsub 过度替换 | `assemble()` 的 `gsub(/\<done\>/, done_var, bodybuf)` 全局替换用户变量 `done`，改为 `_restructure` 生成 body 行时直接使用碰撞感知变量名 | `68a57be` / `0aa08da` |
+| P0-3 | LISTAGG 跨行漏检 | `conv_listagg` 逐行处理，`OVER` 跨行时 `epos==0` 误判为无 OVER → 静默转 GROUP_CONCAT 并残留孤立 `OVER` | `68a57be` / `5a12df3` |
+
 > 测试语料库（companion 目录 `ora2tidb-sp-tests/`，由测试工程师维护）：17 个分级 Oracle SP 样例（T1×6 / T2×5 / T3×6）+ golden + 用例 + 共享 schema + 测试计划。分级 = 转换置信度（T1 简单 / T2 中等 / T3 复杂预期 TODO）。P1 扩展后回归语料库扩为 33 SP（5 组：T1机械/T2忠实/T3结构/T4 P1新功能/T5边界+TODO）。详细结果见语料库 `results/`。
 
 ## 里程碑（设计文档 §7）
@@ -350,7 +360,7 @@ DELIMITER ;
 
 **自动标记 `-- TODO(需人工转换)`**：跨表达式/跨行 `||`（**Route A 下留字面交 PIPES_AS_CONCAT**，TODO 标部署要求——见 Usage Step 5）、`%ROWTYPE`、未解析的 `%TYPE`（无 schema 数据或列未匹配）、`EXECUTE IMMEDIATE` 的 INTO 子句（MySQL PREPARE 无单行 SELECT 返回）、`LISTAGG OVER(PARTITION BY..)` 分析函数形式（MySQL GROUP_CONCAT 不支持）、`BULK COLLECT/FORALL`、`TYPE .. IS TABLE OF/RECORD/VARRAY`（PL/SQL 集合/记录类型，MySQL 无对应——BULK COLLECT 依赖的 TYPE 声明也标 TODO）、`TO_CHAR(number/复杂)`、`DBMS_OUTPUT`、内联游标 `FOR rec IN (SELECT..)`、`GOTO`（MySQL 不支持）、嵌套 `DECLARE..BEGIN..END`（含 EXCEPTION 的复杂嵌套块）。
 
-> ⚠️ **已知限制（LISTAGG OVER 跨行漏检）**：`LISTAGG OVER(PARTITION BY..)` 当 `OVER` 与 `LISTAGG(..) WITHIN GROUP(..)` 在**同一行**时正确标 TODO；当 `OVER` 在**下一行**（跨行）时，逐行处理的 `conv_listagg` 检测不到 → 静默转 `GROUP_CONCAT` 并残留孤立 `OVER (..)`（产出 MySQL 语法错误）。建议源码规范 `LISTAGG OVER` 写在同一行，或转换后人工检查残留 `OVER`。后续 `_mark_complex` 可能加跨行兜底检测。
+> ⚠️ **已知限制（已修复 — P0-3）**：`LISTAGG OVER(PARTITION BY..)` 当 `OVER` 与 `LISTAGG(..) WITHIN GROUP(..)` 在**同一行**时正确标 TODO；当 `OVER` 在**下一行**（跨行）时，原逐行处理的 `conv_listagg` 检测不到。P0-3 已修复：`_mark_complex` 新增 `prev_line` 跨行跟踪 + 3 条检测规则（开括号跨行 / WITHIN GROUP 跨行 / OVER 独立成行），跨行 LISTAGG 现在正确标记 `-- TODO`。
 
 > **FOR 计数器自动 DECLARE**：Oracle 的 FOR 循环变量（`FOR v IN lo..hi` / `FOR v IN REVERSE lo..hi` 的 `v`）是**隐式声明**的。转换器 assemble 阶段会自动注入 `DECLARE v INT DEFAULT <lo 或 hi>;`（forward 初始化=`lo`，REVERSE 初始化=`hi`）——无论源码中 `v` 是否显式 DECLARE。已显式声明的不会重复注入。
 
@@ -381,6 +391,9 @@ DELIMITER ;
 - [x] Bug #2 修复：FOR 计数器隐式变量自动注入 `DECLARE v INT DEFAULT <lo/hi>;`
 - [x] Bug #6 修复：EXIT WHEN 复合条件保留（`%NOTFOUND` 替换为 `done=1`，不丢弃 `OR` 条件）
 - [ ] deferred：T3 族（%ROWTYPE·BULK COLLECT·集合·内联游标 FOR 自动转换）、GOTO→unsupported TODO
+- [x] P0-1：自定义异常 `WHEN <custom_exception>` 分支静默丢弃修复（`68a57be` / `e7ea543`）
+- [x] P0-2：标识符碰撞 gsub 过度替换修复（`68a57be` / `0aa08da`）
+- [x] P0-3：LISTAGG 跨行漏检修复 — `_mark_complex` 新增 `prev_line` 跨行跟踪（`68a57be` / `5a12df3`）
 - [ ] deferred：LISTAGG OVER 跨行兜底检测
 
 ## 常见问题（FAQ）
