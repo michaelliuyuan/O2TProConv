@@ -982,7 +982,7 @@ _nested_blocks() {
 #   自定义异常 CONDITION / RAISE_APPLICATION_ERROR 未覆盖（标 known-limitation）。
 _restructure() {
   awk '
-    BEGIN { state="pre"; IGNORECASE=1; ltop=0; labeln=0; has_ndf=0; has_others=0; done_needed=0; in_cursor=0; block_depth=0; nested_decl_buf=""; done_var="done"; verrmsg_var="v_errmsg"; _seen_done=0; _seen_verrmsg=0 }
+    BEGIN { state="pre"; IGNORECASE=1; ltop=0; labeln=0; has_ndf=0; has_others=0; done_needed=0; in_cursor=0; block_depth=0; nested_decl_buf=""; verrmsg_var="v_errmsg" }
     function newlabel(){ labeln++; return "lp" labeln }
     function is_as_is_line(line) {
       return (line ~ /^[ \t]*(AS|IS)[ \t]*$/) || (line ~ /[)A-Za-z0-9_][ \t]+(AS|IS)[ \t]*$/)
@@ -1066,7 +1066,6 @@ _restructure() {
         if (in_cursor) { curbuf=(curbuf==""?"":curbuf "\n") line; if (line ~ /;[ \t]*$/) in_cursor=0; next }
         if (line ~ /^[ \t]*CURSOR[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IS/) {
           done_needed=1
-          if (_seen_done) done_var = "done_o2t"
           core=line; sub(/^[ \t]+/,"",core); sub(/^CURSOR[ \t]+/,"",core); cname=core; sub(/[ \t]+IS.*$/,"",cname)
           rest=line; sub(/^[ \t]*CURSOR[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IS/,"",rest)
           dline = "    DECLARE " cname " CURSOR FOR" (rest ~ /^[ \t]*$/ ? "" : rest)
@@ -1075,7 +1074,10 @@ _restructure() {
           next
         }
         if (line ~ /^[ \t]*BEGIN[ \t]*$/) { state="body"; next }            # BEGIN 在 assemble() 里发
-        d=conv_decl(line); if (d=="") next; varbuf=(varbuf==""?"":varbuf "\n") d; next
+        d=conv_decl(line); if (d=="") next
+        # 碰撞检测：用户声明了 done / v_errmsg → 合成变量需改名
+        if (match(d, /^DECLARE[ \t]+([A-Za-z_][A-Za-z0-9_]*)/, m)) { if (tolower(m[1])=="done") _seen_done=1; if (tolower(m[1])=="v_errmsg") _seen_verrmsg=1 }
+        varbuf=(varbuf==""?"":varbuf "\n") d; next
       }
       if (state=="nested_decl") {
         if (line ~ /^[ \t]*BEGIN[ \t]*$/) {
@@ -1096,15 +1098,16 @@ _restructure() {
         if (line ~ /^[ \t]*--/) next
         if (line ~ /^[ \t]*$/) next
         d=conv_decl(line); if (d=="") next
+        if (match(d, /^DECLARE[ \t]+([A-Za-z_][A-Za-z0-9_]*)/, m)) { if (tolower(m[1])=="done") _seen_done=1; if (tolower(m[1])=="v_errmsg") _seen_verrmsg=1 }
         nested_decl_buf=nested_decl_buf d "\n"
         next
       }
       if (state=="exception") {
-        if (line ~ /^[ \t]*WHEN[ \t]+OTHERS[ \t]+THEN/)        { exc_curr="others"; has_others=1; next }
+        if (line ~ /^[ \t]*WHEN[ \t]+OTHERS[ \t]+THEN/)        { exc_curr="others"; has_others=1; if (_seen_verrmsg) verrmsg_var = "v_errmsg_o2t"; next }
         if (line ~ /^[ \t]*WHEN[ \t]+NO_DATA_FOUND[ \t]+THEN/) { exc_curr="ndf";    has_ndf=1;     next }
-        if (line ~ /^[ \t]*WHEN[ \t]+/)                         { exc_curr="other"; has_others=1; others_body = others_body "-- TODO(需人工转换): 自定义异常分支需人工创建 DECLARE CONDITION + 独立 EXIT HANDLER，原 body 已注释化保留\n"; next }
+        if (line ~ /^[ \t]*WHEN[ \t]+/)                         { exc_curr="other"; has_others=1; if (_seen_verrmsg) verrmsg_var = "v_errmsg_o2t"; others_body = others_body "-- TODO(需人工转换): 自定义异常分支需人工创建 DECLARE CONDITION + 独立 EXIT HANDLER，原 body 已注释化保留\n"; next }
         if (is_sp_end(line)) { assemble(); state="end"; next }
-        l=conv_assign(line); gsub(/SQLERRM/, "v_errmsg", l)
+        l=conv_assign(line); gsub(/SQLERRM/, verrmsg_var, l)
         if (exc_curr=="ndf")         ndf_body    = (ndf_body==""?"":ndf_body)    l "\n"
         else if (exc_curr=="others") others_body = (others_body==""?"":others_body) l "\n"
         else if (exc_curr=="other")  others_body = others_body "-- " line "\n"
