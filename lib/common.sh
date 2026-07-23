@@ -22,9 +22,10 @@ die()  { err "$*"; exit 1; }
 load_config() {
   local cfg="$1"
   [[ -f "$cfg" ]] || die "配置文件不存在: $cfg"
-  # shellcheck disable=SC1090
+# shellcheck disable=SC1090
   set -a; source "$cfg"; set +a
   [[ -n "${ORACLE_HOST:-}" ]] || die "配置缺少 Oracle 连接信息（ORACLE_HOST 等）"
+  export NLS_LANG="AMERICAN_AMERICA.${ORACLE_CHARSET:-AL32UTF8}"
 }
 
 # ---------- 依赖检查 ----------
@@ -63,8 +64,6 @@ oracle_connect() {
   : "${ORACLE_HOST:?配置缺少 ORACLE_HOST}"
   : "${ORACLE_PORT:?配置缺少 ORACLE_PORT}"
   : "${ORACLE_SERVICE:?配置缺少 ORACLE_SERVICE}"
-  local charset="${ORACLE_CHARSET:-AL32UTF8}"
-  export NLS_LANG="AMERICAN_AMERICA.${charset}"
   printf '%s/%s@//%s:%s/%s' "$ORACLE_USER" "$ORACLE_PASS" "$ORACLE_HOST" "$ORACLE_PORT" "$ORACLE_SERVICE"
 }
 
