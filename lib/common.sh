@@ -63,6 +63,8 @@ oracle_connect() {
   : "${ORACLE_HOST:?配置缺少 ORACLE_HOST}"
   : "${ORACLE_PORT:?配置缺少 ORACLE_PORT}"
   : "${ORACLE_SERVICE:?配置缺少 ORACLE_SERVICE}"
+  local charset="${ORACLE_CHARSET:-AL32UTF8}"
+  export NLS_LANG="AMERICAN_AMERICA.${charset}"
   printf '%s/%s@//%s:%s/%s' "$ORACLE_USER" "$ORACLE_PASS" "$ORACLE_HOST" "$ORACLE_PORT" "$ORACLE_SERVICE"
 }
 

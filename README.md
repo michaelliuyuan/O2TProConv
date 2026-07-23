@@ -86,6 +86,7 @@ awk --version | head -1                   # 须含 'GNU Awk'（或 PATH 有 gawk
 cp ora2tidb.conf.example ora2tidb.conf
 # 编辑 ora2tidb.conf：
 #   ORACLE_USER/PASS/HOST/PORT/SERVICE   Oracle 连接（export 导出 + compare 对比）
+#   ORACLE_CHARSET                       Oracle 数据库字符集（须与 NLS_CHARACTERSET 一致，默认 AL32UTF8；中文 GBK 环境须设为 ZHS16GBK）
 #   TIDB_USER/PASS/HOST/PORT/DB           TiDB 连接（compare 对比 + capability 探针）
 #   EXPORT_DIR/CONVERTED_DIR/REPORT_DIR   产物目录（相对项目根，也可绝对路径）
 #   EXPORT_OBJECT_TYPES                   导出对象类型（冒号分隔；留空=默认 PROCEDURE:FUNCTION:PACKAGE BODY:PACKAGE）
