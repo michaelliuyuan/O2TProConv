@@ -41,6 +41,11 @@ run_convert() {
   mkdir -p "$CONVERTED_DIR" "$REPORT_DIR"
 
   local report="$REPORT_DIR/convert_report.md"
+  if [[ -f "$report" ]]; then
+    local backup="$REPORT_DIR/convert_report_$(date +%Y%m%d_%H%M%S).md"
+    cp "$report" "$backup"
+    info "已备份旧报告 → ${backup##*/}"
+  fi
   {
     echo "# 转换报告"
     echo
