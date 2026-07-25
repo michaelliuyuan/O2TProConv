@@ -810,8 +810,9 @@ _emit_fn_stub() {
 # 机械转换：安全的、确定性的 token / 模式替换（GNU sed，支持 \b 与 I 标志）。
 _apply_mechanical() {
   sed -E \
+    -e '/^[[:space:]]*--.*[^[:print:][:space:]]/s/.*//' \
     -e '/^[[:space:]]*--/b' \
-    -e 's/[[:space:]]*---[[:space:]]*[^[:print:][:space:]].*$//' \
+    -e 's/[[:space:]]*--[[:space:]]*[^[:print:][:space:]].*$//' \
     -e 's/\bNVARCHAR2[ \t]*\(/NVARCHAR(/gI' \
     -e 's/\bNVARCHAR2\b/NVARCHAR(4000)/gI' \
     -e 's/\bVARCHAR2[ \t]*\(/VARCHAR(/gI' \
