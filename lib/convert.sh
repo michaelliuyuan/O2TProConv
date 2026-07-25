@@ -58,7 +58,7 @@ run_convert() {
 
   shopt -s nullglob
   local f base out todos status total=0 need_review=0 failed=0
-  local note_section="" sem_section="" todo_section="" tmpdir
+  local note_section="" sem_section="" todo_section="" pipes_section="" tmpdir
   tmpdir="$(mktemp -d)"
   for f in "$ORACLE_DIR"/*.sql; do
     [[ "$(basename "$f")" == _* ]] && continue      # 跳过 _proc_list.tsv 等辅助文件
@@ -84,6 +84,9 @@ run_convert() {
             printf '| %s | %s | %s |\n' "$pkg_base" "已自动转换" "0" >>"$report"
           fi
           log "  $pkg_base → $pkg_out（TODO: $pkg_todos）"
+          local pkg_pipe_count
+          pkg_pipe_count=$(grep -cE '\|\|' "$pkg_out" 2>/dev/null || true)
+          [[ "$pkg_pipe_count" -gt 0 ]] && pipes_section+="  - **$pkg_base**：${pkg_pipe_count} 处 || 依赖 PIPES_AS_CONCAT（输出文件头部已注入 SET SESSION sql_mode）"$'\n'
         done
       else
         # PACKAGE BODY 拆分失败 → 原样转换（产出 defensive check 失败）
@@ -94,6 +97,22 @@ run_convert() {
         total=$((total+1)); failed=$((failed+1))
         printf '| %s | %s | %s |\n' "$base" "⚠️ PACKAGE BODY 拆分失败，需人工" "$todos" >>"$report"
         log "  $base → $out（PACKAGE BODY 拆分失败）"
+        local pkg_pipe_count
+        pkg_pipe_count=$(grep -cE '\|\|' "$out" 2>/dev/null || true)
+        [[ "$pkg_pipe_count" -gt 0 ]] && pipes_section+="  - **$base**：${pkg_pipe_count} 处 || 依赖 PIPES_AS_CONCAT（输出文件头部已注入 SET SESSION sql_mode）"$'\n'
+      fi
+      continue
+    fi
+
+    # PACKAGE spec 处理：提取 TYPE 声明（特别是 REF CURSOR），保存供 PACKAGE BODY 转换使用
+    if grep -qiE '^CREATE[[:space:]]+OR[[:space:]]+REPLACE[[:space:]]+PACKAGE[[:space:]]+' "$f" 2>/dev/null && \
+       ! grep -qiE 'PACKAGE[[:space:]]+BODY' "$f" 2>/dev/null; then
+      local pkg_types; pkg_types="$(_extract_pkg_spec_types "$f" "$tmpdir" "$base")"
+      if [[ -n "$pkg_types" ]]; then
+        printf '%s\n' "$pkg_types" > "$tmpdir/${base}_pkg_types.txt"
+        log "  $base → PACKAGE spec（TYPE 声明已提取：$(echo "$pkg_types" | wc -l) 个）"
+      else
+        log "  $base → PACKAGE spec（无 TYPE 声明，跳过）"
       fi
       continue
     fi
@@ -132,10 +151,23 @@ run_convert() {
     [[ "$n2" -gt 0 ]] && sem_line+="NVL2→IF(Oracle ''≡NULL vs MySQL ''≠NULL，空串路径分歧)×${n2}；"
     [[ "$dt" -gt 0 ]] && sem_line+="DATE→DATETIME widening(Oracle DATE 带时分秒→MySQL DATETIME 保时间；若下游期望 DATE 仅日期精度需核对)×${dt}；"
     [[ -n "$sem_line" ]] && sem_section+="  - **$base**：${sem_line}"$'\n'
+    # P2-b: 检测输出中残留 ||（SQL 字符串值内/跨行），记录 PIPES_AS_CONCAT 依赖
+    local pipe_count
+    pipe_count=$(grep -cE '\|\|' "$out" 2>/dev/null || true)
+    [[ "$pipe_count" -gt 0 ]] && pipes_section+="  - **$base**：${pipe_count} 处 || 依赖 PIPES_AS_CONCAT（输出文件头部已注入 SET SESSION sql_mode）"$'\n'
     log "  $base → $out（TODO: $todos）"
   done
   shopt -u nullglob
   rm -rf "$tmpdir"
+
+  # P3-e: 自定义函数自动迁移——扫描所有转换输出中的 FUNC_xxx() 调用，
+  # 查 _function_sources/*.fnc 递归转 TiDB CREATE FUNCTION DDL → _custom_functions.tidb.sql
+  local custom_fn_report
+  custom_fn_report="$(_convert_custom_functions)"
+  local custom_fn_section=""
+  if [[ -n "$custom_fn_report" ]]; then
+    custom_fn_section="$custom_fn_report"
+  fi
 
   {
     echo
@@ -172,6 +204,28 @@ run_convert() {
       printf '%s' "$todo_section"
     else
       echo "无 TODO 标记（所有结构均自动转换）。"
+    fi
+    echo
+    echo "## 自定义函数迁移（P3-e）"
+    echo
+    if [[ -n "$custom_fn_section" ]]; then
+      echo "下列 Oracle 自定义函数已被检测并处理（DDL 输出到 \`_custom_functions.tidb.sql\`）："
+      echo
+      printf '%s' "$custom_fn_section"
+    else
+      echo "无自定义函数调用（或函数已随 PACKAGE BODY 转换）。"
+    fi
+    echo
+    echo "## PIPES_AS_CONCAT 部署检查"
+    echo
+    if [[ -n "$pipes_section" ]]; then
+      echo "⚠️ 部署红线：目标 TiDB sql_mode 必须保留 PIPES_AS_CONCAT（v7.1.9 默认已含）。"
+      echo "SP 内所有 ||（含动态 SQL PREPARE/EXECUTE）在 CREATE PROCEDURE 时锁定 sql_mode，后续 session sql_mode 变更不影响行为。"
+      echo "输出文件头部已注入幂等 \`SET SESSION sql_mode = CONCAT(@@sql_mode, ',PIPES_AS_CONCAT')\` 作为保底。"
+      echo
+      printf '%s' "$pipes_section"
+    else
+      echo "无 || 残留（所有 || 已自动转 CONCAT(IFNULL)，不依赖 PIPES_AS_CONCAT）。"
     fi
   } >>"$report"
 
@@ -239,6 +293,33 @@ _split_package_body() {
     END { if (in_sp && !flushed) flush_sp() }
   ' "$pkg_file"
   printf '%s' "$sp_list"
+}
+
+# PACKAGE spec TYPE 提取：从 Oracle PACKAGE 规范中提取 TYPE 声明（REF CURSOR 等），
+# 输出格式：<类型名> <类型类别>，供 PACKAGE BODY 转换时注入类型信息。
+_extract_pkg_spec_types() {
+  local pkg_file="$1" tmpdir="$2" prefix="$3"
+  awk '
+    BEGIN { IGNORECASE=1 }
+    /^[ \t]*TYPE[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IS[ \t]+REF[ \t]+CURSOR/ {
+      line = $0
+      sub(/^[ \t]*TYPE[ \t]+/,"",line)
+      type_name = line; sub(/[ \t]+IS.*$/,"",type_name)
+      print type_name " REF_CURSOR"
+    }
+    /^[ \t]*TYPE[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IS[ \t]+(TABLE[ \t]+OF|RECORD|VARRAY)/ {
+      line = $0
+      sub(/^[ \t]*TYPE[ \t]+/,"",line)
+      type_name = line; sub(/[ \t]+IS.*$/,"",type_name)
+      print type_name " COLLECTION"
+    }
+    /^[ \t]*SUBTYPE[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IS/ {
+      line = $0
+      sub(/^[ \t]*SUBTYPE[ \t]+/,"",line)
+      type_name = line; sub(/[ \t]+IS.*$/,"",type_name)
+      print type_name " SUBTYPE"
+    }
+  ' "$pkg_file"
 }
 
 # %TYPE 锚定类型解析：查 _schema_columns.tsv 将 table.column%TYPE / column%TYPE
@@ -312,6 +393,52 @@ _resolve_anchor_type() {
   '
 }
 
+# P2-d: REF CURSOR 后处理——删除 SP body 中使用 OPEN FOR 的 REF CURSOR OUT 参数，
+# 并合并双重执行（EXECUTE IMMEDIATE var + OPEN cursor FOR var 同变量）。
+# 在所有转换 pass 之后运行。输入：stdin，输出：stdout。
+_cleanup_ref_cursor() {
+  local text; text="$(cat)"
+  # 检测是否有 OPEN <name> FOR 的 TODO（_restructure 转换后留下的标记）
+  local cursor_var
+  cursor_var="$(printf '%s\n' "$text" | sed -nE 's/.*OPEN ([A-Za-z_][A-Za-z0-9_]*) FOR.*已转为 PREPARE.*/\1/p' | head -1)"
+  if [[ -n "$cursor_var" ]]; then
+    # 1. 删除参数列表中的 OUT <cursor_var> <TYPE> 参数（处理尾逗号）
+    # 模式: ..., OUT cursor_var TYPE) → ...)
+    text="$(printf '%s\n' "$text" | sed -E "s/,[[:space:]]*OUT[[:space:]]+${cursor_var}[[:space:]]+[A-Za-z_][A-Za-z0-9_]*([[:space:]]*\))/\1/g")"
+    # 模式: 独占行 OUT cursor_var TYPE) → 删除整行，上一行参数的尾逗号在 _param_mode 已处理
+    text="$(printf '%s\n' "$text" | sed -E "/^[[:space:]]*OUT[[:space:]]+${cursor_var}[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\)/d")"
+    # 2. 双重执行合并：删除 EXECUTE IMMEDIATE 残留的 PREPARE/EXECUTE/DEALLOCATE 块
+    # 2. 双重执行合并：删除 EXECUTE IMMEDIATE 残留的 SET/PREPARE/EXECUTE/DEALLOCATE 块
+    #    从 OPEN FOR TODO 行向前搜索，找到紧邻的 SET/PREPARE/EXECUTE/DEALLOCATE 4 行块
+    local todo_line
+    todo_line="$(printf '%s\n' "$text" | grep -n 'OPEN '"$cursor_var"' FOR.*已转为 PREPARE' | head -1 | cut -d: -f1)"
+    if [[ -n "$todo_line" ]]; then
+      # 向前搜索最多 10 行，找 SET @sql = 行
+      local i found_set=0
+      for ((i=todo_line-1; i>=todo_line-10 && i>=1; i--)); do
+        local check_line
+        check_line="$(printf '%s\n' "$text" | sed -n "${i}p")"
+        if echo "$check_line" | grep -qE 'SET @sql = '; then
+          # 验证后续 3 行是 PREPARE/EXECUTE/DEALLOCATE
+          local l2 l3 l4
+          l2="$(printf '%s\n' "$text" | sed -n "$((i+1))p")"
+          l3="$(printf '%s\n' "$text" | sed -n "$((i+2))p")"
+          l4="$(printf '%s\n' "$text" | sed -n "$((i+3))p")"
+          if echo "$l2" | grep -q 'PREPARE stmt' && \
+             echo "$l3" | grep -q 'EXECUTE stmt' && \
+             echo "$l4" | grep -q 'DEALLOCATE PREPARE'; then
+            # 删除这 4 行（EXECUTE IMMEDIATE 残留）
+            text="$(printf '%s\n' "$text" | sed -E "${i},$((i+3))d")"
+            found_set=1
+            break
+          fi
+        fi
+      done
+    fi
+  fi
+  printf '%s' "$text"
+}
+
 # 转换单个文件
 convert_one() {
   local in="$1" out="$2"
@@ -327,9 +454,35 @@ convert_one() {
   text="$(_nested_blocks  <<<"$text")"
   text="$(_restructure    <<<"$text")"
   text="$(_convert_type_aware <<<"$text")"
+  text="$(_cleanup_ref_cursor <<<"$text")"
   {
     echo "-- 由 oracle2tidb-sp 自动转换生成；请核对带 -- TODO(需人工转换) 的行"
-    # _rewrite_header 注入的真实 DROP 可能位于首部注释之后（源文件带头部注释）。
+    # P2-b: 若输出含残留 ||（SQL 字符串值内或跨行未转），注入幂等 SET SESSION sql_mode
+    # 保证 CREATE PROCEDURE 时当前连接含 PIPES_AS_CONCAT（TiDB v7.1.9 默认已含，此为保底）。
+    # SP 在 CREATE 时锁定 sql_mode，后续 CALL 不受 session 变更影响（含 SP 内 PREPARE/EXECUTE）。
+    local need_pipes
+    need_pipes="$(printf '%s\n' "$text" | grep -cE '\|\|' 2>/dev/null || true)"
+    if [[ "${need_pipes:-0}" -gt 0 ]]; then
+      echo "-- INFO: 本文件含 || 拼接（SQL 字符串值内/跨行），依赖 PIPES_AS_CONCAT。"
+      echo "-- CREATE PROCEDURE 时 sql_mode 须含 PIPES_AS_CONCAT（TiDB v7.1.9 默认已含）。"
+      echo "-- SP 内所有 ||（含动态 SQL PREPARE/EXECUTE）在 CREATE 时锁定，后续 session 变更不影响。"
+      echo "SET SESSION sql_mode = IF(LOCATE('PIPES_AS_CONCAT', @@sql_mode) > 0, @@sql_mode, CONCAT(@@sql_mode, ',PIPES_AS_CONCAT'));"
+    fi
+    # P3-e: 自定义函数调用检测——检测输出含 FUNC_xxx( 调用模式，
+    # 记录函数名供 run_convert 全局去重递归转换（DDL 输出到 _custom_functions.tidb.sql）。
+    # _mark_complex 已在各调用点注入 INFO 注释（含替代建议）。
+    # 若 _function_sources/*.fnc 存在，run_convert 会递归转换出完整 TiDB CREATE FUNCTION；
+    # 若不存在，run_convert 输出 DDL 桩 + TODO（需业务方实现）。
+    local custom_fns
+    custom_fns="$(printf '%s\n' "$text" | grep -oE 'FUNC_[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(' 2>/dev/null | sed -E 's/[[:space:]]*\(//' | sort -u || true)"
+    if [[ -n "$custom_fns" ]]; then
+      echo "-- INFO: 本 SP 调用以下自定义函数（DDL 见 _custom_functions.tidb.sql 或文件头部桩）:"
+      local fn
+      while IFS= read -r fn; do
+        [[ -z "$fn" ]] && continue
+        echo "--   $fn"
+      done <<<"$custom_fns"
+    fi
     # 从任意位置抽出 DROP 行、提到 DELIMITER // 之前——默认分隔符下执行、幂等：
     # 反馈环每次 pull 新 hash 重跑不会因 duplicate 挂；DROP 也不会被 // 分隔符吞掉成语法错。
     local drop_line body_text
@@ -345,6 +498,104 @@ convert_one() {
     echo "//"
     echo "DELIMITER ;"
   } >"$out"
+}
+
+# P3-e: 自定义函数自动迁移——扫描所有转换输出中的 FUNC_xxx() 调用，
+# 查 _function_sources/*.fnc 递归转 TiDB CREATE FUNCTION DDL。
+# 输出：① _custom_functions.tidb.sql（全局合并，去重）② 报告文本（stdout）
+# 逻辑：
+#   - 收集所有 .tidb.sql 中的 FUNC_xxx( 调用 → 唯一函数名集合
+#   - 对每个函数名：查 $ORACLE_DIR/_function_sources/<owner>.<name>.fnc（遍历所有 owner）
+#   - 找到 .fnc → 注入 "CREATE OR REPLACE " 前缀 → 递归 convert_one → 输出完整 DDL
+#   - 未找到 → 输出 DDL 桩 + TODO（参数/返回类型未知 → VARCHAR(4000) 兜底）
+_convert_custom_functions() {
+  local fn_dir="${ORACLE_DIR:-$EXPORT_DIR}/_function_sources"
+  local out_file="$CONVERTED_DIR/_custom_functions.tidb.sql"
+  local report=""
+
+  # 1) 扫描所有转换输出，收集唯一自定义函数名（跳过注释行，避免注释中提及的函数名误生成桩）
+  local all_fns
+  all_fns="$(grep -rhE --exclude='_custom_functions.tidb.sql' 'FUNC_[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(' "$CONVERTED_DIR"/*.tidb.sql 2>/dev/null \
+             | grep -vE '^[[:space:]]*--' \
+             | grep -ohE 'FUNC_[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(' \
+             | sed -E 's/[[:space:]]*\(//' | sort -u || true)"
+  [[ -z "$all_fns" ]] && return 0
+
+  : >"$out_file"
+  echo "-- 自定义函数迁移（P3-e 自动递归转换）" >>"$out_file"
+  echo "-- 由 oracle2tidb-sp 从 _function_sources/*.fnc 递归转换生成" >>"$out_file"
+  echo >>"$out_file"
+
+  local fn fn_found=0 fn_stub=0
+  while IFS= read -r fn; do
+    [[ -z "$fn" ]] && continue
+    local fnc_file=""
+    # 查找匹配的 .fnc 文件（文件名格式：<owner>.<function_name>.fnc）
+    if [[ -d "$fn_dir" ]]; then
+      # glob 匹配所有 *.<fn>.fnc 文件，取第一个匹配
+      local fnc_glob
+      shopt -s nullglob
+      fnc_glob=( "$fn_dir"/*."${fn}".fnc )
+      shopt -u nullglob
+      if [[ ${#fnc_glob[@]} -gt 0 ]]; then
+        fnc_file="${fnc_glob[0]}"
+      fi
+    fi
+
+    if [[ -n "$fnc_file" && -f "$fnc_file" ]]; then
+      # 2a) 找到 .fnc → 递归转换
+      local fn_tmp; fn_tmp="$(mktemp)"
+      # all_source 输出以 "FUNCTION name(...)" 开头，无 CREATE OR REPLACE
+      # 注入 "CREATE OR REPLACE " 前缀使 convert_one pipeline 能识别头部
+      # 去 UTF-8 BOM（EF BB BF）和前导空白，避免前缀与 FUNCTION 间夹 BOM 导致头部正则失配
+      local fn_body; fn_body="$(sed -E '1s/^\xEF\xBB\xBF//; s/^[[:space:]]*//' "$fnc_file")"
+      printf 'CREATE OR REPLACE %s\n' "$fn_body" >"$fn_tmp"
+      local fn_out; fn_out="$(mktemp)"
+      convert_one "$fn_tmp" "$fn_out"
+      # 校验转换成功（输出含 CREATE FUNCTION）
+      if grep -qE '^CREATE[[:space:]]+FUNCTION' "$fn_out"; then
+        cat "$fn_out" >>"$out_file"
+        echo >>"$out_file"
+        report+="  - **$fn** ✅ 从 \`.fnc\` 递归转换（完整 TiDB DDL）"$'\n'
+        fn_found=$((fn_found+1))
+        local fn_todos; fn_todos=$(grep -cE '^[[:space:]]*--[[:space:]]*TODO\(' "$fn_out" || true)
+        [[ "$fn_todos" -gt 0 ]] && report+="    - ⚠️ 转换含 ${fn_todos} 个 TODO 需人工复核"$'\n'
+      else
+        # 转换失败 → 桩 + TODO
+        _emit_fn_stub "$fn" >>"$out_file"
+        echo >>"$out_file"
+        report+="  - **$fn** ⚠️ \`.fnc\` 存在但转换失败（头部 parse 失败），已输出 DDL 桩 + TODO"$'\n'
+        fn_stub=$((fn_stub+1))
+      fi
+      rm -f "$fn_tmp" "$fn_out"
+    else
+      # 2b) 未找到 .fnc → DDL 桩 + TODO
+      _emit_fn_stub "$fn" >>"$out_file"
+      echo >>"$out_file"
+      report+="  - **$fn** ⚠️ 无 \`.fnc\` 源码（权限不足或未导出），已输出 DDL 桩 + TODO"$'\n'
+      fn_stub=$((fn_stub+1))
+    fi
+  done <<<"$all_fns"
+
+  report+=$'\n'"**合计**：$((fn_found + fn_stub)) 个自定义函数（${fn_found} 个递归转换、${fn_stub} 个 DDL 桩）。"$'\n'
+  printf '%s' "$report"
+}
+
+# 自定义函数 DDL 桩生成器——当无 .fnc 源码或转换失败时输出。
+# 参数/返回类型未知 → VARCHAR(4000) 兜底 + TODO。
+# 输出到 stdout。
+_emit_fn_stub() {
+  local fn="$1"
+  echo "-- TODO(需人工实现): 自定义函数 $fn 无 Oracle 源码（.fnc 未导出或转换失败）"
+  echo "-- 需手动实现或从 Oracle all_source 拉取后重跑 convert"
+  echo "DROP FUNCTION IF EXISTS $fn;"
+  echo "DELIMITER //"
+  echo "CREATE FUNCTION $fn() RETURNS VARCHAR(4000)"
+  echo "BEGIN"
+  echo "  -- TODO: 实现函数逻辑（参数/返回类型未知，已用 VARCHAR(4000) 兜底）"
+  echo "  RETURN NULL;"
+  echo "END //"
+  echo "DELIMITER ;"
 }
 
 # 机械转换：安全的、确定性的 token / 模式替换（GNU sed，支持 \b 与 I 标志）。
@@ -432,9 +683,39 @@ _convert_known_semantics() {
       cnt++; A[cnt]=cur
       return cnt
     }
+    # has_unclosed_decode: 检查行中是否有 DECODE( 的括号未闭合（跨行标志）
+    # 逐字符扫描，跳过字符串字面量，找到 DECODE 后的 ( 检查 match_paren 是否闭合
+    function has_unclosed_decode(s,   n,i,c,pos,cpos,epos,in_str,nx,depth){
+      n=length(s); in_str=0; depth=0
+      i=1
+      while(i<=n){
+        c=substr(s,i,1)
+        if(in_str){ if(c==q){ nx=substr(s,i+1,1); if(nx==q){i++;continue} else in_str=0 } i++; continue }
+        if(c==q){ in_str=1; i++; continue }
+        if(c=="(") depth++
+        else if(c==")") depth--
+        # 检测 DECODE( 关键字（跳过被标识符字符前导的）
+        if(depth>=0 && toupper(substr(s,i,6))=="DECODE"){
+          pos=i
+          # 确认是独立关键字（前面非标识符字符）
+          if(pos==1 || substr(s,pos-1,1) !~ /[A-Za-z0-9_]/){
+            # 找到 DECODE 后的 ( （允许空格）
+            cpos=i+6
+            while(cpos<=n && (substr(s,cpos,1)==" "||substr(s,cpos,1)=="\t")) cpos++
+            if(cpos<=n && substr(s,cpos,1)=="("){
+              epos=match_paren(s,cpos)
+              if(epos==0) return 1  # 未闭合的 DECODE
+              i=epos+1; continue  # 已闭合，跳过
+            }
+          }
+        }
+        i++
+      }
+      return 0
+    }
     function conv_decode(line,   out,pos,prev,cpos,epos,mid,A,n,i,expr,cs){
       out=""
-      while(match(line,/DECODE[ \t]*\(/)){
+      while(match(line,/[Dd][Ee][Cc][Oo][Dd][Ee][ \t]*\(/)){
         pos=RSTART
         if(pos>1){ prev=substr(line,pos-1,1); if(prev~/[A-Za-z0-9_]/){ out=out substr(line,1,pos); line=substr(line,pos+1); continue } }
         cpos=pos+RLENGTH-1
@@ -447,33 +728,124 @@ _convert_known_semantics() {
         while(i+1<=n){ cs=cs " WHEN " expr " <=> " A[i] " THEN " A[i+1]; i+=2 }
         if(i<=n) cs=cs " ELSE " A[i]
         cs=cs " END"
-        out=out substr(line,1,pos-1) cs
-        line=substr(line,epos+1)
+        out=out substr(line,1,pos-1)
+        line=cs substr(line,epos+1)
       }
       return out line
     }
-    function conv_concat(line,   out,re,m,pre,chain,rest,A,n,i,inner,cs,unsafe,rs,rl){
-      # 动态正则里 \( \) \. \| 都会被当普通字符（gawk 警告），故字面量一律用方括号类：
-      # [(] [)] [|] [.] —— 避免 || 被解析成两个交替运算符破坏链匹配。
-      re = "(:=|[(),]|(RETURN|SELECT|VALUES|WHERE|THEN|ELSE|WHEN)[ \t]+)[ \t]*([A-Za-z_][A-Za-z0-9_.#$]*[(][^()]*[)]|[A-Za-z_][A-Za-z0-9_.#$]*|" q "[^" q "]*" q "|[0-9]+([.][0-9]+)?)([ \t]*[|][|][ \t]*([A-Za-z_][A-Za-z0-9_.#$]*[(][^()]*[)]|[A-Za-z_][A-Za-z0-9_.#$]*|" q "[^" q "]*" q "|[0-9]+([.][0-9]+)?))+"
+    # scan_concat: 字符级扫描行，找到第一个 || 链并返回 [prefix, chain, suffix]。
+    # prefix = 链前的所有字符（含 := 或关键字前缀），chain = 完整 || 链表达式，
+    # suffix = 链后字符（含终止符 ; ) , 等）。
+    # 返回 1 表示找到可处理的链，0 表示无。
+    # 设置全局 _concat_prefix / _concat_chain / _concat_suffix。
+    function scan_concat(s,   n,i,c,in_str,nx,depth,pp1,chain_start,chain_end,c2,after_pipe){
+      n=length(s); in_str=0; depth=0
+      # 1. 正向扫描找到第一个 depth==0 的 ||
+      pp1=0
+      for(i=1;i<=n;i++){
+        c=substr(s,i,1)
+        if(in_str){ if(c==q){ nx=substr(s,i+1,1); if(nx==q){ i++; continue } else in_str=0 } continue }
+        if(c==q){ in_str=1; continue }
+        if(c=="(") depth++
+        else if(c==")") depth--
+        else if(depth==0 && c=="|" && i<n && substr(s,i+1,1)=="|"){ pp1=i; break }
+      }
+      if(pp1==0) return 0
+
+      # 2. 从 pp1 向前找链起始：回扫到前缀边界（:= / 关键字 / 行首 / 分隔符）
+      chain_start=pp1
+      in_str=0; depth=0
+      i=pp1-1
+      # 跳过空格
+      while(i>=1 && (substr(s,i,1)==" "||substr(s,i,1)=="\t")) i--
+      # 向前扫描第一个 operand
+      # operand 可以是：字符串字面量、标识符/函数调用、数字、(括号表达式)
+      while(i>=1){
+        c=substr(s,i,1)
+        if(c==")"){ depth++; chain_start=i; i--; continue }
+        if(c=="("){ if(depth>0){ depth--; chain_start=i; i--; continue } else break }
+        if(depth>0){ chain_start=i; i--; continue }
+        # depth==0
+        if(c=="|"){
+          # 可能是前一个 || 的尾 | ——说明前面还有 || 对
+          if(i>=2 && substr(s,i-1,1)=="|"){ i-=2; while(i>=1 && (substr(s,i,1)==" "||substr(s,i,1)=="\t")) i--; continue }
+          break
+        }
+        if(c==q){
+          # 字符串字面量结尾——回扫匹配开头
+          i--
+          while(i>=1){
+            if(substr(s,i,1)==q){ nx=substr(s,i-1,1); if(nx==q){ i-=2; continue } else { i--; break } }
+            i--
+          }
+          chain_start=i+1
+          # 字符串前可能有更多 operand 或前缀
+          while(i>=1 && (substr(s,i,1)==" "||substr(s,i,1)=="\t")) i--
+          if(i>=1 && substr(s,i,1)=="|"){ continue }
+          break
+        }
+        if(c==","||c==";"||c=="("||c=="\t"){ break }
+        if(c==" "){
+          # 检查前面是否是 || 或关键字前缀
+          j=i-1
+          while(j>=1 && (substr(s,j,1)==" "||substr(s,j,1)=="\t")) j--
+          if(j>=1 && substr(s,j,1)=="|"){ continue }
+          break
+        }
+        chain_start=i
+        i--
+      }
+      # 跳过链起始前导空格
+      while(chain_start<pp1 && (substr(s,chain_start,1)==" "||substr(s,chain_start,1)=="\t")) chain_start++
+
+      # 3. 从 pp1 向后找链结束
+      chain_end=pp1+1  # 第二个 |
+      in_str=0; depth=0
+      i=pp1+2  # 第一个 || 之后
+      while(i<=n){
+        c=substr(s,i,1)
+        if(in_str){ chain_end=i; if(c==q){ nx=substr(s,i+1,1); if(nx==q){ i+=2; continue } else in_str=0 } i++; continue }
+        if(c==q){ in_str=1; chain_end=i; i++; continue }
+        if(c=="(") depth++
+        else if(c==")"){
+          if(depth==0){ chain_end=i-1; break }  # 退出链包裹的括号（如 IF(x||y)）
+          depth--
+        }
+        else if(depth==0 && c=="|" && i<n && substr(s,i+1,1)=="|"){
+          i+=2; continue  # 下一个 ||
+        }
+        if(depth==0 && (c==";"||c==",")){ chain_end=i-1; break }
+        chain_end=i
+        i++
+      }
+      # trim trailing whitespace from chain
+      while(chain_end>chain_start && (substr(s,chain_end,1)==" "||substr(s,chain_end,1)=="\t")) chain_end--
+
+      _concat_prefix=substr(s,1,chain_start-1)
+      _concat_chain=substr(s,chain_start,chain_end-chain_start+1)
+      _concat_suffix=substr(s,chain_end+1)
+      return 1
+    }
+    function conv_concat(line,   out,A,n,i,inner,cs,unsafe,ss,found){
       out=""
-      while(match(line,re)){
-        rs=RSTART; rl=RLENGTH                         # match(m,...) 下面会覆盖全局 RSTART/RLENGTH，先存
-        m=substr(line,rs,rl)
-        rest=substr(line,rs+rl)
-        # rest 须以 ;/) /, 终结（非裸 EOL）：裸 EOL = 多行 || 链续行（如 sp_format_report
-        # SELECT 'DEPT='||v_dname 续到下行），不在此部分转——Route A 下整链留字面交 PIPES_AS_CONCAT。
-        if(rest !~ /^[ \t]*[;),]/){ out=out substr(line,1,rs); line=substr(line,rs+1); continue }
-        if(match(m,/^(:=|[(),]|(RETURN|SELECT|VALUES|WHERE|THEN|ELSE|WHEN)[ \t]+)[ \t]*/)){ pre=substr(m,1,RLENGTH); chain=substr(m,RLENGTH+1) } else { pre=""; chain=m }
-        n=split_pipes(chain,A)
+      while((found=scan_concat(line))){
+        # suffix 须以 ;/) /, 终结（非裸 EOL）：裸 EOL = 多行续行
+        if(_concat_suffix !~ /^[ \t]*[;),]/){
+          pipe_info=pipe_info "|| 跨行续行保留字面，依赖 PIPES_AS_CONCAT; "
+          out=out _concat_prefix _concat_chain
+          line=_concat_suffix
+          continue
+        }
+        n=split_pipes(_concat_chain,A)
+        if(n<2){ out=out _concat_prefix _concat_chain; line=_concat_suffix; continue }
         unsafe=0
         for(i=1;i<=n;i++){ ss=strip_str(A[i]); if(ss ~ /[+\-*/=<>]/ || ss ~ /(^|[^A-Za-z0-9_])(AND|OR|NOT|FROM|WHERE|SELECT|INTO|VALUES|THEN|ELSE|WHEN|CASE|END)([^A-Za-z0-9_]|$)/){ unsafe=1; break } }
-        if(unsafe){ todo=todo "|| 操作数边界不可靠，保留字面；目标库须 sql_mode 含 PIPES_AS_CONCAT 且 SP 须此模式下 CREATE（创建时锁定），否则 ||=OR; "; out=out substr(line,1,rs+rl-1); line=rest; continue }
+        if(unsafe){ pipe_info=pipe_info "|| 操作数边界不可靠保留字面，依赖 PIPES_AS_CONCAT; "; out=out _concat_prefix _concat_chain; line=_concat_suffix; continue }
         inner=""
         for(i=1;i<=n;i++){ inner=(i==1?"":inner ", ") "IFNULL(" trim(A[i]) "," q q ")" }
         cs="NULLIF(CONCAT(" inner ")," q q ")"
-        out=out substr(line,1,rs-1) pre cs
-        line=rest
+        out=out _concat_prefix cs
+        line=_concat_suffix
       }
       return out line
     }
@@ -534,6 +906,9 @@ _convert_known_semantics() {
         # 跨行 LISTAGG（括号不配对）→ 不在此处理，留 _mark_complex 统一检测
         if(epos==0){ out=out substr(line,1,pos); line=substr(line,pos+1); continue }
         mid=substr(line,cpos+1,epos-cpos-1); n=split_topcomma(mid,A)
+        # 动态 SQL 内 LISTAGG(col, '','') 的 '' 转义：split_topcomma 将 '','' 误拆为两个空串
+        # n==3 且 A[2]=='' 和 A[3]=='' → 合并为 n==2, A[2]='',''（动态 SQL 中的逗号分隔符，保留转义）
+        if(n==3 && A[2]==q q && A[3]==q q){ n=2; A[2]=q q "," q q }
         if(n<1 || n>2){ out=out substr(line,1,epos); line=substr(line,epos+1); continue }
         expr=trim(A[1])
         sep=(n==2 ? trim(A[2]) : q q)
@@ -563,8 +938,19 @@ _convert_known_semantics() {
           out=out substr(line,1,pos-1) repl
           line=substr(rest, wg_end+1)
         } else {
-          # LISTAGG 不带 WITHIN GROUP → 不处理（非标准/跨行），留 _mark_complex TODO
-          out=out substr(line,1,epos); line=rest; continue
+          # LISTAGG 不带 WITHIN GROUP → 直接转 GROUP_CONCAT（无 ORDER BY）；
+          # 检查 OVER (PARTITION BY ...) 分析函数形式
+          if(match(rest,/^[ \t]*OVER[ \t]*\(/)){
+            todo=todo "LISTAGG OVER(PARTITION BY) 分析函数 MySQL GROUP_CONCAT 不支持，需人工; "
+            out=out substr(line,1,epos); line=rest; continue
+          }
+          if (expr ~ /^[ \t]*DISTINCT[ \t]+/i) {
+            repl="GROUP_CONCAT(" expr " SEPARATOR " sep ")"
+          } else {
+            repl="GROUP_CONCAT(" expr " SEPARATOR " sep ")"
+          }
+          out=out substr(line,1,pos-1) repl
+          line=rest
         }
       }
       return out line
@@ -599,14 +985,27 @@ _convert_known_semantics() {
       line=$0
       if(line ~ /^[ \t]*--/){ print line; next }
       todo=""
+      pipe_info=""
+      # P2-c: 跨行 DECODE 归一化——检测未闭合的 DECODE(，缓冲后续行直到括号闭合
+      if(has_unclosed_decode(line)){
+        _dj=line; _dn=1
+        while(_dn < 50 && has_unclosed_decode(_dj)){
+          if((getline _dnx) <= 0) break
+          _dn++
+          if(_dnx ~ /^[ \t]*--/){ print _dnx; continue }
+          _dj=_dj " " _dnx
+        }
+        line=_dj
+      }
       line=conv_decode(line)
       line=conv_concat(line)
       line=conv_nvl2(line)
       line=conv_add_months(line)
       line=conv_months_between(line)
       line=conv_listagg(line)
-      if(code_has_pipe(line))   todo=todo "|| 保留字面（SELECT 列表/跨行表达式边界不可靠，未自动转）；目标库须 sql_mode 含 PIPES_AS_CONCAT 且 SP 须此模式下 CREATE（创建时锁定），否则 ||=OR 算错；含 NULL 操作数时改 CONCAT(IFNULL)（简单 || 已自动转）; "
+      if(code_has_pipe(line))   pipe_info="|| 拼接保留字面（SQL 字符串值内/跨行/操作数不可靠），依赖 PIPES_AS_CONCAT（CREATE 时锁定，TiDB v7.1.9 默认已含）; "
       if(code_has_decode(line)) todo=todo "DECODE 未能自动转换（跨行/畸形），需人工 CASE; "
+      if(pipe_info != "") print "-- INFO: " pipe_info
       if(todo != "") print "-- TODO(需人工转换): " todo
       print line
     }
@@ -619,7 +1018,33 @@ _convert_known_semantics() {
 # 必须在 _apply_mechanical（SYSDATE→NOW）之前跑，否则 NOW() 带括号匹配不到。
 _tochar_date() {
   awk '
-    BEGIN { q = sprintf("%c", 39); re = "(TO_CHAR|TO_DATE)\\([^,()]*,[ \\t]*" q "[^" q "]*" q }
+    BEGIN { q = sprintf("%c", 39) }
+    function match_paren(s, op,   n,i,depth,c,in_str,nx){
+      n=length(s); depth=0; in_str=0
+      for(i=op;i<=n;i++){
+        c=substr(s,i,1)
+        if(in_str){ if(c==q){ nx=substr(s,i+1,1); if(nx==q){i++;continue} else in_str=0 } continue }
+        if(c==q){ in_str=1; continue }
+        if(c=="(") depth++
+        else if(c==")"){ depth--; if(depth==0) return i }
+      }
+      return 0
+    }
+    function split_topcomma(s, A,   n,i,c,depth,in_str,cur,cnt,nx){
+      n=length(s); depth=0; in_str=0; cur=""; cnt=0
+      for(i=1;i<=n;i++){
+        c=substr(s,i,1)
+        if(in_str){ cur=cur c; if(c==q){ nx=substr(s,i+1,1); if(nx==q){cur=cur nx; i++;continue} else in_str=0 } continue }
+        if(c==q){ in_str=1; cur=cur c; continue }
+        if(c=="("){ depth++; cur=cur c; continue }
+        if(c==")"){ depth--; cur=cur c; continue }
+        if(c=="," && depth==0){ cnt++; A[cnt]=cur; cur=""; continue }
+        cur=cur c
+      }
+      cnt++; A[cnt]=cur
+      return cnt
+    }
+    function trim(s){ sub(/^[ \t]+/,"",s); sub(/[ \t]+$/,"",s); return s }
     function mapmask(s,   r) {
       r = s
       gsub(/YYYY/, "%Y", r); gsub(/YY/, "%y", r)
@@ -630,19 +1055,32 @@ _tochar_date() {
       return r
     }
     {
-      if ($0 ~ /^[ \t]*--/) { print; next }      # 跳过注释行（不在注释里做转换）
-      while (match($0, re)) {
-        whole = substr($0, RSTART, RLENGTH)
-        fn = (substr(whole,1,7) == "TO_DATE") ? "STR_TO_DATE" : "DATE_FORMAT"
-        p = index(whole, ",")
-        arg = substr(whole, 9, p - 9)
-        m = substr(whole, p + 1); sub(/^[ \t]*/, "", m); gsub(q, "", m)
-        mm = mapmask(m)
-        if (mm == m) break                              # 无日期 token → 留给 TODO
-        rep = fn "(" arg ", " q mm q                    # 不含结尾 ")"，原 ")" 保留
-        $0 = substr($0, 1, RSTART - 1) rep substr($0, RSTART + RLENGTH)
+      if ($0 ~ /^[ \t]*--/) { print; next }
+      out=""
+      line=$0
+      while (match(line, /(TO_CHAR|TO_DATE)[ \t]*\(/)) {
+        pos=RSTART
+        # 跳过被标识符字符前导的（如 MY_TO_CHAR(）
+        if(pos>1){ prev=substr(line,pos-1,1); if(prev~/[A-Za-z0-9_]/){ out=out substr(line,1,pos); line=substr(line,pos+1); continue } }
+        kw=substr(line,pos,RLENGTH)
+        cpos=pos+RLENGTH-1
+        epos=match_paren(line,cpos)
+        if(epos==0){ break }  # 跨行，留给后续 pass
+        mid=substr(line,cpos+1,epos-cpos-1)
+        n=split_topcomma(mid,A)
+        if(n!=2){ out=out substr(line,1,epos); line=substr(line,epos+1); continue }
+        arg1=trim(A[1]); arg2=trim(A[2])
+        # 第二参数须是字符串字面量（日期掩码）
+        if(substr(arg2,1,1)!=q) { out=out substr(line,1,epos); line=substr(line,epos+1); continue }
+        m=arg2; gsub(q,"",m)
+        mm=mapmask(m)
+        if(mm==m){ out=out substr(line,1,epos); line=substr(line,epos+1); continue }  # 无日期 token → 跳过，继续扫描后续
+        fn=(substr(kw,1,6)=="TO_DAT") ? "STR_TO_DATE" : "DATE_FORMAT"
+        rep=fn "(" arg1 ", " q mm q ")"
+        out=out substr(line,1,pos-1) rep
+        line=substr(line,epos+1)
       }
-      print
+      print out line
     }
   '
 }
@@ -672,11 +1110,16 @@ _convert_type_aware() {
       if (tl ~ /^(VARCHAR|CHAR|TEXT|CLOB|NVARCHAR|NCHAR|BLOB|BINARY|VARBINARY)$/) return "string"
       if (tl ~ /^(BOOL|BOOLEAN)$/) return "bool"
       return "" }
-    function match_paren(s,op,   n,i,depth,c){ n=length(s); depth=0
-      for(i=op;i<=n;i++){ c=substr(s,i,1); if(c=="(")depth++; else if(c==")"){depth--; if(depth==0)return i} }
+    function match_paren(s,op,   n,i,depth,c,in_str,nx){ n=length(s); depth=0; in_str=0
+      for(i=op;i<=n;i++){ c=substr(s,i,1)
+        if(in_str){ if(c==q){ nx=substr(s,i+1,1); if(nx==q){i++;continue} else in_str=0 } continue }
+        if(c==q){ in_str=1; continue }
+        if(c=="(")depth++; else if(c==")"){depth--; if(depth==0)return i} }
       return 0 }
-    function split_topcomma(s,A,   n,i,c,depth,cur,cnt){ n=length(s);depth=0;cur="";cnt=0
+    function split_topcomma(s,A,   n,i,c,depth,in_str,cur,cnt,nx){ n=length(s);depth=0;in_str=0;cur="";cnt=0
       for(i=1;i<=n;i++){ c=substr(s,i,1)
+        if(in_str){ cur=cur c; if(c==q){ nx=substr(s,i+1,1); if(nx==q){cur=cur nx; i++;continue} else in_str=0 } continue }
+        if(c==q){ in_str=1; cur=cur c; continue }
         if(c=="(")depth++; else if(c==")")depth--
         else if(c==","&&depth==0){cnt++;A[cnt]=trim(cur);cur="";continue}
         cur=cur c }
@@ -745,8 +1188,17 @@ _convert_type_aware() {
         out=out substr(line,1,pos-1) rep; line=substr(line,epos+1)
       }
       return out line }
-    function conv_to_char_num(line,   out,pos,prev,cpos,epos,mid,A,n,tc,rep){
-      out=""   # TO_CHAR(number) 单参→CAST AS CHAR；TO_CHAR(date,'mask') 已由 _tochar_date 转 DATE_FORMAT
+    function mapmask(s,   r) {
+      r = s
+      gsub(/YYYY/, "%Y", r); gsub(/YY/, "%y", r)
+      gsub(/MONTH/, "%M", r); gsub(/MON/, "%b", r); gsub(/MM/, "%m", r)
+      gsub(/DD/, "%d", r)
+      gsub(/HH24/, "%H", r); gsub(/HH12/, "%h", r); gsub(/HH/, "%H", r)
+      gsub(/MI/, "%i", r); gsub(/SS/, "%s", r)
+      return r
+    }
+    function conv_to_char_num(line,   out,pos,prev,cpos,epos,mid,A,n,tc,rep,mm,m){
+      out=""   # TO_CHAR(number) 单参→CAST AS CHAR；TO_CHAR(date,'mask')→DATE_FORMAT
       while(match(line,/TO_CHAR[ \t]*\(/)){
         pos=RSTART
         if(pos>1){ prev=substr(line,pos-1,1); if(prev~/[A-Za-z0-9_]/){ out=out substr(line,1,pos); line=substr(line,pos+1); continue } }
@@ -754,12 +1206,19 @@ _convert_type_aware() {
         if(epos==0){ note=note "TO_CHAR 跨行需人工; "; out=out line; return out }
         mid=substr(line,cpos+1,epos-cpos-1); n=split_topcomma(mid,A); rep=substr(line,pos,epos-pos+1)
         if (n==1) { if (infer_type(A[1])=="number") rep="CAST(" A[1] " AS CHAR)"; else { note=note "TO_CHAR(" A[1] ") 非 number 单参需人工; "; rep="NULL" } }
+        else if (n==2 && substr(A[2],1,1)==q) {
+          # TO_CHAR(date_expr, 'mask') → DATE_FORMAT(date_expr, '%mask')（掩码含日期 token 时转）
+          m=A[2]; gsub(q,"",m)
+          mm=mapmask(m)
+          if(mm!=m) rep="DATE_FORMAT(" A[1] ", " q mm q ")"
+          else { note=note "TO_CHAR(..,..) 多参(number+fmt 或残留 date)需人工; "; rep="NULL" }
+        }
         else        { note=note "TO_CHAR(..,..) 多参(number+fmt 或残留 date)需人工; "; rep="NULL" }
         out=out substr(line,1,pos-1) rep; line=substr(line,epos+1)
       }
       return out line }
     function conv_substr(line,   out,pos,prev,cpos,epos,mid,A,n,rep){
-      out=""   # SUBSTR(s,0,n)→SUBSTRING(s,1,n)；start>=1 字面量 MySQL SUBSTR 兼容不变；start=变量→NOTE
+      out=""   # SUBSTR(s,0,n)→SUBSTRING(s,1,n)；start>=1 字面量 MySQL SUBSTR 兼容不变；start=变量→透传（Oracle/TiDB SUBSTR 语义一致，均 1-based）
       while(match(line,/SUBSTR[ \t]*\(/)){
         pos=RSTART
         if(pos>1){ prev=substr(line,pos-1,1); if(prev~/[A-Za-z0-9_]/){ out=out substr(line,1,pos); line=substr(line,pos+1); continue } }
@@ -767,9 +1226,8 @@ _convert_type_aware() {
         if(epos==0){ note=note "SUBSTR 跨行需人工; "; out=out line; return out }
         mid=substr(line,cpos+1,epos-cpos-1); n=split_topcomma(mid,A); rep=substr(line,pos,epos-pos+1)
         if (n>=2) {
-          if (A[2]=="0") rep="SUBSTRING(" A[1] ", 1" (n>=3 ? ", " A[3] : "") ")"   # start=0→1，2/3 参通用（gsub 只匹 3 参会漏 2 参 SUBSTR(s,0)→SUBSTRING(s,0)='' silent）
-          else if (A[2] !~ /^[0-9]+$/) { note=note "SUBSTR start 非字面量(" A[2] ") 可能 0 偏移需人工; "; rep="NULL" }
-          # start>=1 字面量：原 SUBSTR 在 MySQL 合法（SUBSTRING 别名），不变
+          if (A[2]=="0") rep="SUBSTRING(" A[1] ", 1" (n>=3 ? ", " A[3] : "") ")"   # start=0→1，2/3 参通用
+          # start 为变量/表达式：Oracle 和 TiDB SUBSTR 语义一致（均 1-based），直接透传不标 TODO
         }
         out=out substr(line,1,pos-1) rep; line=substr(line,epos+1)
       }
@@ -834,6 +1292,8 @@ _mark_complex() {
       # 生成 IFNULL(op,'')，与 NVL(x,'') 文本同形、post-mechanical 无法区分，全量标记只会误报每一处
       # ||。NVL(x,'') 分歧属已知 niche 边缘，由文档记录、不在此标记。
       if ($0 ~ /%TYPE|%ROWTYPE/)                 todo("锚定类型 %TYPE/%ROWTYPE 需解析为具体类型")
+      # REF CURSOR 类型声明：TYPE x IS REF CURSOR → 删除（TiDB 不支持类型声明，P2-d 自动处理）
+      if ($0 ~ /^[ \t]*TYPE[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+IS[ \t]+REF[ \t]+CURSOR/) { print "-- INFO: REF CURSOR 类型声明已删除（TiDB 不支持 TYPE 声明，SP 直接返回最后 SELECT 结果集）"; prev_line=$0; next }
       # 注：EXECUTE IMMEDIATE 现由 _restructure 半自动转 PREPARE/EXECUTE/DEALLOCATE（INTO 子句标 TODO）
       if ($0 ~ /BULK[ \t]+COLLECT|FORALL/)       todo("批量操作 BULK COLLECT/FORALL 无直接对应，需改写为游标循环")
       # Oracle PL/SQL 集合类型声明（关联 BULK COLLECT）→ MySQL 无对应，标 TODO
@@ -845,6 +1305,16 @@ _mark_complex() {
       if ($0 ~ /DBMS_OUTPUT/)                    todo("DBMS_OUTPUT 需改 SELECT 结果 / 写日志表")
       if ($0 ~ /(^|[^A-Za-z0-9_])GOTO[ \t]+[A-Za-z_]/) todo("GOTO 语句 MySQL 不支持，需改写为 IF/LOOP/LEAVE 控制流")
       if ($0 ~ /<<[A-Za-z_][A-Za-z0-9_]*>>/) todo("GOTO 标签 <<label>> MySQL 不支持，需配合 GOTO 改写移除")
+      # P3-e: 外部自定义函数检测（通用 FUNC_xxx 模式）——标 INFO（非 TODO），DDL 由
+      # _convert_custom_functions 全局递归转换到 _custom_functions.tidb.sql（有 .fnc 源码）
+      # 或输出 DDL 桩 + TODO（无源码）。
+      # 特定函数附加上下文提醒：
+      if ($0 ~ /(^|[^A-Za-z0-9_])FUNC_dsensitive_permissions[ \t]*\(/) print "-- INFO: 调用自定义函数 FUNC_dsensitive_permissions（DDL 见 _custom_functions.tidb.sql）；注意：GROUP BY 中应使用原始列值，脱敏仅在 SELECT 层生效"
+      else if ($0 ~ /(^|[^A-Za-z0-9_])FUNC_[A-Za-z_][A-Za-z0-9_]*[ \t]*\(/) {
+        match($0, /FUNC_[A-Za-z_][A-Za-z0-9_]*/)
+        fn_name = substr($0, RSTART, RLENGTH)
+        print "-- INFO: 调用自定义函数 " fn_name "（DDL 见 _custom_functions.tidb.sql）"
+      }
       # 注：EXCEPTION 块（WHEN NO_DATA_FOUND/OTHERS）/ 显式游标 CURSOR..IS / 数值 FOR..IN / 游标 FOR rec IN cur LOOP / REVERSE FOR
       # 现由 _restructure 自动转换（EXIT handler / DECLARE..CURSOR FOR + done / WHILE+计数器 / OPEN+FETCH+CLOSE / WHILE 递减）；
       # 非 REVERSE 数值范围外的 FOR..IN 在 _restructure 内单独标 TODO。此处不再标 FOR/EXCEPTION/CURSOR，避免残留假阳性。
@@ -1413,6 +1883,18 @@ _restructure() {
         } else {
           bodybuf=bodybuf ind "EXECUTE stmt" exec_suffix ";\n"
         }
+        bodybuf=bodybuf ind "DEALLOCATE PREPARE stmt;\n"; next
+      }
+      # OPEN cursor_name FOR sql_expression; → PREPARE/EXECUTE/DEALLOCATE（TiDB SP 直接返回结果集）
+      if (line ~ /^[ \t]*OPEN[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+FOR[ \t]+/) {
+        ind=getindent(line); core=substr(line,length(ind)+1)
+        sub(/^OPEN[ \t]+/,"",core); cursor_name=core; sub(/[ \t]+FOR.*$/,"",cursor_name)
+        sub(/^[A-Za-z_][A-Za-z0-9_]*[ \t]+FOR[ \t]+/,"",core); sub(/;[ \t]*$/,"",core)
+        sql_expr=core; gsub(/^[ \t]+|[ \t]+$/,"",sql_expr)
+        bodybuf=bodybuf ind "-- INFO: OPEN " cursor_name " FOR 已转为 PREPARE/EXECUTE 返回结果集（TiDB SP 直接返回最后 SELECT 结果集；REF CURSOR OUT 参数已自动删除）\n"
+        bodybuf=bodybuf ind "SET @sql = " sql_expr ";\n"
+        bodybuf=bodybuf ind "PREPARE stmt FROM @sql;\n"
+        bodybuf=bodybuf ind "EXECUTE stmt;\n"
         bodybuf=bodybuf ind "DEALLOCATE PREPARE stmt;\n"; next
       }
       l=conv_assign(line); bodybuf=bodybuf l "\n"

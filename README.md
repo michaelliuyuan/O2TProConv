@@ -27,6 +27,8 @@
 | 7 | `_rewrite_header` | `CREATE OR REPLACE` → `DROP IF EXISTS`+`CREATE`；FUNCTION 头 `RETURN<type>`→`RETURNS<type>` |
 | 8 | `_param_mode` | 参数模式前置（`name IN type`→`IN name type`）；FUNCTION 参数剥 `IN/OUT` |
 | 9 | `_restructure` | 结构改写：删 `AS/IS`、`:=` 两态、DECLARE 序重排、EXCEPTION→EXIT handler、显式游标、WHILE/FOR/CONTINUE |
+| 10 | `_convert_type_aware` | 类型推断（symtab）：TRUNC/INSTR/TO_NUMBER/TO_CHAR(num)/SUBSTR/NEXTVAL 按变量类型自动转换 |
+| 11 | `_cleanup_ref_cursor` | P2-d：REF CURSOR OUT 参数删除 + 双重执行合并 |
 
 **三层 + 一条原则**：
 
@@ -396,6 +398,15 @@ DELIMITER ;
 - [x] P0-2：标识符碰撞 gsub 过度替换修复（`68a57be` / `0aa08da`）
 - [x] P0-3：LISTAGG 跨行漏检修复 — `_mark_complex` 新增 `prev_line` 跨行跟踪（`68a57be` / `5a12df3`）
 - [x] P0 回归验证通过（基线 27 SP 零回归 + 6 P0 专项 SP 通过）— `0aa08da`
+- [x] **P2-a**：`||` 字符级扫描器（`scan_concat`）替代正则，含 `''` 转义/函数调用的拼接链自动转 `NULLIF(CONCAT(IFNULL(...)))`（113→82 TODO）
+- [x] **P2-b**：SQL 字符串值内 `||` → INFO + 文件头部注入幂等 `SET SESSION sql_mode`（TiDB v7.1.9 默认已含 `PIPES_AS_CONCAT`，SP CREATE 时锁定）（82→54）
+- [x] **P2-c**：跨行 DECODE 归一化（`has_unclosed_decode` + `getline` 缓冲 + CASE WHEN 转换，`max_join_lines=50`）（54→42）
+- [x] **P2-d**：REF CURSOR 自动删除（TYPE 声明删除 + OUT 参数清理 + 双重执行合并）（42→39）
+- [x] **P2-e**：TO_DATE/TO_CHAR 增强（`match_paren`+`split_topcomma` 支持含 `||`/逗号/括号的复杂参数）（39→33）
+- [x] **P2-f**：自定义函数 DDL 桩注入（`FUNC_GET_VARCHAR`/`FUNC_dsensitive_permissions` → INFO + CREATE FUNCTION 模板）（33→11）
+- [x] **P2-g**：SUBSTR 变量 start 降级（Oracle/TiDB 均 1-based，透传不标 TODO）
+- [x] P2 回归验证通过（`PKG_CB_LIST_CB.pck`：113 TODO → 11，27 SP 语料库零回归）
+- [ ] deferred：T3 族（%ROWTYPE·BULK COLLECT·集合·内联游标 FOR 自动转换）、GOTO→unsupported TODO、动态 SQL 字符串值内残留深度解析
 
 ## 常见问题（FAQ）
 

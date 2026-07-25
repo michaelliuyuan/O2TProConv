@@ -104,5 +104,54 @@ SQL
     : >"$cols_file"
   fi
 
+  # 4) 导出自定义函数源码 → _function_sources/*.fnc（供 convert 递归转换自定义函数调用）
+  # P3-e：查 all_source WHERE type='FUNCTION'，按 name+line 排序拼接，每个函数一个 .fnc 文件。
+  # 失败不阻断 export 主流程（函数源码是 convert 的增强数据源，缺则自定义函数降级 DDL 桩 + TODO）。
+  local fn_src_dir="$EXPORT_DIR/_function_sources"
+  mkdir -p "$fn_src_dir"
+  # 先查函数清单：owner<TAB>name
+  local fn_list_file="$EXPORT_DIR/_function_list.tsv"
+  if sqlplus -s -L "$conn" >"$fn_list_file" <<SQL
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF LINESIZE 32767 TRIMSPOOL ON
+WHENEVER OSERROR EXIT FAILURE;
+WHENEVER SQLERROR EXIT FAILURE;
+SELECT owner || CHR(9) || name
+FROM   all_source
+WHERE  type = 'FUNCTION'
+  AND  owner = UPPER('$schema')
+GROUP BY owner, name
+ORDER BY owner, name;
+EXIT;
+SQL
+  then
+    local fn_count; fn_count=$(grep -c . "$fn_list_file" || true)
+    if [[ "$fn_count" -gt 0 ]]; then
+      local fn_owner fn_name fn_out_fn fn_idx=0
+      while IFS=$'\t' read -r fn_owner fn_name; do
+        [[ -z "${fn_name:-}" ]] && continue
+        fn_idx=$((fn_idx+1))
+        fn_out_fn="$fn_src_dir/${fn_owner}.${fn_name}.fnc"
+        # 拉取函数完整源码（按 line 排序拼接 text 列）
+        sqlplus -s -L "$conn" >"$fn_out_fn" <<SQL
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF LINESIZE 32767 TRIMSPOOL ON LONG 2000000 LONGCHUNKSIZE 2000000
+SELECT text
+FROM   all_source
+WHERE  type = 'FUNCTION'
+  AND  owner = UPPER('$fn_owner')
+  AND  name = UPPER('$fn_name')
+ORDER BY line;
+EXIT;
+SQL
+        log "  [FN $fn_idx/$fn_count] FUNCTION ${fn_owner}.${fn_name} → $(wc -l <"$fn_out_fn") 行"
+      done < "$fn_list_file"
+      info "自定义函数源码导出：$fn_count 个 → $fn_src_dir/"
+    else
+      info "schema=$schema 下无自定义函数（_function_sources/ 为空）"
+    fi
+  else
+    warn "自定义函数源码导出失败（all_source 权限不足？convert 将降级为 DDL 桩 + TODO）"
+    : >"$fn_list_file"
+  fi
+
   info "导出完成：$i 个文件写入 $EXPORT_DIR"
 }
