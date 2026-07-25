@@ -1566,6 +1566,14 @@ _param_mode() {
       s=$0; no=gsub(/\(/,"",s); s=$0; nc=gsub(/\)/,"",s)
       # 先判断本行是否含 AS/IS（参数区结束标志），但参数重写仍需在本行执行
       line_has_as = ($0 ~ /[ \t](AS|IS)[ \t]*$/ || $0 ~ /^[ \t]*(AS|IS)[ \t]*$/)
+      if (active && !closed) {
+        # Oracle 参数行含行内 -- 注释（如 P_STATDATE1 IN VARCHAR2, --统计起始日期）
+        # MySQL/TiDB CREATE PROCEDURE 参数列表不接受行内注释（ERROR 1064 in DELIMITER block）
+        # 去掉参数区内的 -- 行内注释（-- 到行尾）
+        sub(/--[ \t]*.*$/, "", $0)
+        # 去注释后若只剩空白则跳过
+        if ($0 ~ /^[ \t]*$/) { depth += (no - nc); next }
+      }
       if (active && !closed && !isfunc) {
         $0 = gensub(/([(, \t])([A-Za-z_][A-Za-z0-9_]*)[ \t]+(IN[ \t]+OUT|INOUT|IN|OUT)[ \t]+/, "\\1\\3 \\2 ", "g")
         gsub(/IN[ \t]+OUT/, "INOUT")
