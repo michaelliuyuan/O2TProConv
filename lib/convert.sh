@@ -653,7 +653,7 @@ _cleanup_ref_cursor() {
 # Also clears pure-comment lines that become empty after stripping.
 _strip_gbk_comments() {
   sed -E \
-    -e 's/[^[:print:][:space:]]//g' \
+    -e 's/[^[:print:][:space:]]/?/g' \
     -e 's/[[:space:]]*-*--[[:space:]]*$//' \
     -e 's/--([^[:space:]\/-])/-- \1/g' \
     -e '/^[[:space:]]*\/\*[[:space:]]*$/d' \
