@@ -2078,8 +2078,20 @@ _restructure() {
               bodybuf=bodybuf ind "EXECUTE stmt INTO " _into_var exec_suffix ";\n"
             }
           } else {
-            bodybuf=bodybuf ind "-- TODO(需人工转换): EXECUTE IMMEDIATE INTO " into_vars " 多变量需改 DECLARE+OPEN/FETCH 游标\n"
-            bodybuf=bodybuf ind "EXECUTE stmt" exec_suffix ";\n"
+            # P5-b: 多变量 INTO → 复用 @o2t_into_ 中转模式（与单变量一致）
+            _into_list = ""
+            _set_list = ""
+            for (_vi = 1; _vi <= _n_into; _vi++) {
+              _v = _into_arr[_vi]; gsub(/^[ \t]+|[ \t]+$/, "", _v)
+              if (_v !~ /^@/) {
+                _into_list = (_into_list == "" ? "" : _into_list ", ") "@o2t_into_" _v
+                _set_list = _set_list ind "SET " _v " = @o2t_into_" _v ";\n"
+              } else {
+                _into_list = (_into_list == "" ? "" : _into_list ", ") _v
+              }
+            }
+            bodybuf=bodybuf ind "EXECUTE stmt INTO " _into_list exec_suffix ";\n"
+            bodybuf=bodybuf _set_list
           }
         } else {
           bodybuf=bodybuf ind "EXECUTE stmt" exec_suffix ";\n"
