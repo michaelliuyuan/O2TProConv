@@ -393,6 +393,205 @@ _resolve_anchor_type() {
   '
 }
 
+# P4-a: %ROWTYPE 自动展开——查 _schema_columns.tsv 将 v_name table%ROWTYPE
+# 展开为逐字段 DECLARE，并替换 body 中 v_name.column → v_name_column。
+# 位置：在 _resolve_anchor_type 之后（复用已加载的 schema 列定义），
+#       在 _apply_mechanical 之前（输出 Oracle 原生类型，复用机械层映射）。
+# 离线 fallback：无 _schema_columns.tsv 或表未匹配 → 原样保留（由 _mark_complex 兜底 TODO）。
+# SCHEMA_COLUMNS 环境变量可覆盖默认路径（$ORACLE_DIR/_schema_columns.tsv）。
+_resolve_rowtype() {
+  local cols_file="${SCHEMA_COLUMNS:-${ORACLE_DIR:-$EXPORT_DIR}/_schema_columns.tsv}"
+  [[ -f "$cols_file" ]] || { cat; return 0; }   # 无 schema 数据 → 原样透传
+  gawk -v cols="$cols_file" '
+    BEGIN { q = sprintf("%c", 39) }
+
+    # 加载 schema 列定义（与 _resolve_anchor_type 同格式）
+    function load_schema(   line, n, f, owner, tab, col, dtype, dlen, dprec, dscale, key) {
+      while ((getline line < cols) > 0) {
+        n = split(line, f, "\t")
+        if (n < 8) continue
+        owner = toupper(f[1]); tab = toupper(f[2]); col = f[3]
+        dtype = toupper(f[4]); dlen = f[5]; dprec = f[6]; dscale = f[7]
+        coltype[owner SUBSEP tab SUBSEP toupper(col)] = type_expr(dtype, dlen, dprec, dscale)
+        # 按出现顺序记录列名（TSV 已按 column_name 排序或保持 DDL 序）
+        key = owner SUBSEP tab
+        if (!(key in col_count)) { col_count[key] = 0; has_table[key] = 1 }
+        col_count[key]++
+        col_names[key, col_count[key]] = col
+      }
+      close(cols)
+    }
+
+    function type_expr(dt, dl, dp, ds,    t) {
+      t = dt
+      if (t == "VARCHAR2" || t == "CHAR" || t == "NVARCHAR2" || t == "NCHAR" || t == "RAW") return t "(" dl ")"
+      if (t == "NUMBER") {
+        if (dp != "" && ds != "") return "NUMBER(" dp "," ds ")"
+        if (dp != "") return "NUMBER(" dp ")"
+        return "NUMBER"
+      }
+      return t
+    }
+
+    # 引号感知替换：在代码段（非字符串内）将 v_name. 替换为 v_name_
+    function code_replace_dot(s, vname,   n, i, c, nx, in_str, result, pat, vlen) {
+      n = length(s); in_str = 0; result = ""
+      vlen = length(vname)
+      for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        if (in_str) {
+          result = result c
+          if (c == q) { nx = substr(s, i + 1, 1); if (nx == q) { result = result nx; i++; continue } else in_str = 0 }
+          continue
+        }
+        if (c == q) { in_str = 1; result = result c; continue }
+        # 代码段：检测 v_name 后面跟 .
+        if (substr(s, i, vlen) == vname && substr(s, i + vlen, 1) == ".") {
+          result = result vname "_"
+          i += vlen  # 跳过 vname，. 由 i++ 跳过
+          continue
+        }
+        result = result c
+      }
+      return result
+    }
+
+    # 检测行中代码段是否含 v_name. 引用（引号感知）
+    function code_has_dot(s, vname,   n, i, c, nx, in_str, vlen) {
+      n = length(s); in_str = 0; vlen = length(vname)
+      for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        if (in_str) {
+          if (c == q) { nx = substr(s, i + 1, 1); if (nx == q) { i++; continue } else in_str = 0 }
+          continue
+        }
+        if (c == q) { in_str = 1; continue }
+        if (substr(s, i, vlen) == vname && substr(s, i + vlen, 1) == ".") return 1
+      }
+      return 0
+    }
+
+    # 检测行中字符串段是否含 v_name. 引用（用于动态 SQL TODO 标记）
+    function str_has_dot(s, vname,   n, i, c, nx, in_str, vlen) {
+      n = length(s); in_str = 0; vlen = length(vname)
+      for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        if (in_str) {
+          if (c == q) { nx = substr(s, i + 1, 1); if (nx == q) { i++; continue } else in_str = 0 }
+          else if (substr(s, i, vlen) == vname && substr(s, i + vlen, 1) == ".") return 1
+          continue
+        }
+        if (c == q) { in_str = 1; continue }
+      }
+      return 0
+    }
+
+    # 变量名安全 guard：长度 >= 3，非保留词
+    function valid_varname(v) {
+      if (length(v) < 3) return 0
+      if (v ~ /^(CUR|ROW|REC|TMP|VAL|VAR|NUM|STR)$/i) return 0
+      return 1
+    }
+
+    # 查表获取列列表 key（owner SUBSEP tab），owner 缺省时匹配任意 owner
+    function find_table_key(tab_name,   np, parts, tab, owner, k, kk) {
+      np = split(tab_name, parts, ".")
+      if (np == 1) {
+        tab = toupper(parts[1])
+        for (k in has_table) {
+          split(k, kk, SUBSEP)
+          if (kk[2] == tab) return k
+        }
+        return ""
+      } else if (np == 2) {
+        owner = toupper(parts[1]); tab = toupper(parts[2])
+        if ((owner SUBSEP tab) in has_table) return owner SUBSEP tab
+        return ""
+      }
+      return ""
+    }
+
+    # 展开一张表的列为 DECLARE 声明片段（逐字段 v_prefix_colname TYPE）
+    function expand_declares(vname, tkey,   i, nc, col, ct, out) {
+      nc = col_count[tkey]
+      out = ""
+      for (i = 1; i <= nc; i++) {
+        col = col_names[tkey, i]
+        ct = coltype[tkey SUBSEP toupper(col)]
+        if (ct == "") ct = "VARCHAR2(4000)"
+        out = out vname "_" col " " ct
+        if (i < nc) out = out ";\n  "
+      }
+      return out
+    }
+
+    # 生成逐字段 INTO 列表（v_name_col1, v_name_col2, ...）
+    function expand_into_list(vname, tkey,   i, nc, col, out) {
+      nc = col_count[tkey]
+      out = ""
+      for (i = 1; i <= nc; i++) {
+        col = col_names[tkey, i]
+        if (i > 1) out = out ", "
+        out = out vname "_" col
+      }
+      return out
+    }
+
+    NR == 1 { load_schema() }
+
+    {
+      line = $0
+      if (line ~ /^[[:space:]]*--/) { print; next }
+
+      # 检测 %ROWTYPE 声明：v_name [owner.]table%ROWTYPE
+      if (match(line, /[A-Za-z_][A-Za-z0-9_]*[[:space:]]+([A-Za-z_][A-Za-z0-9_]*[.])?[A-Za-z_][A-Za-z0-9_]*%ROWTYPE/)) {
+        decl = substr(line, RSTART, RLENGTH)
+        # 提取 var_name（第一个 token）
+        var_name = decl; sub(/[[:space:]].*$/, "", var_name)
+        # 提取 table_name（var_name 之后、%ROWTYPE 之前）
+        table_part = decl; sub(/^[A-Za-z_][A-Za-z0-9_]*[[:space:]]+/, "", table_part); sub(/%ROWTYPE.*$/, "", table_part)
+
+        if (!valid_varname(var_name)) {
+          print "-- TODO(需人工转换): %ROWTYPE 变量名 " q var_name q " 过短或为保留词，需人工展开"
+          next
+        }
+
+        tkey = find_table_key(table_part)
+        if (tkey == "") {
+          print "-- TODO(需人工转换): %ROWTYPE 表 " table_part " 未在 schema 数据中找到，需人工展开"
+          next
+        }
+
+        # 记录 var → table 映射供后续行引用替换
+        rowtype_var[var_name] = tkey
+        # 输出逐字段 DECLARE
+        print "-- INFO: " var_name " " table_part "%ROWTYPE 自动展开为逐字段"
+        print "  " expand_declares(var_name, tkey) ";"
+        next
+      }
+
+      # 对已收集的 %ROWTYPE 变量做引用替换
+      line_done = 0
+      for (vn in rowtype_var) {
+        # 1) 动态 SQL 字符串内含 v_name.col → 标 TODO 不替换
+        if (str_has_dot(line, vn)) {
+          if (!line_done) {
+            print "-- TODO(需人工转换): 动态 SQL 字符串内 " vn ".column 引用需人工展开为逐字段变量"
+            print line
+            line_done = 1
+          }
+          break
+        }
+        # 2) 代码层 v_name.col → v_name_col（引号感知）
+        if (code_has_dot(line, vn)) {
+          line = code_replace_dot(line, vn)
+        }
+      }
+      if (!line_done) print line
+    }
+  '
+}
+
 # P2-d: REF CURSOR 后处理——删除 SP body 中使用 OPEN FOR 的 REF CURSOR OUT 参数，
 # 并合并双重执行（EXECUTE IMMEDIATE var + OPEN cursor FOR var 同变量）。
 # 在所有转换 pass 之后运行。输入：stdin，输出：stdout。
@@ -445,6 +644,7 @@ convert_one() {
   local text; text="$(cat "$in")"
   text="$(_tochar_date       <<<"$text")"
   text="$(_resolve_anchor_type <<<"$text")"
+  text="$(_resolve_rowtype   <<<"$text")"
   text="$(_apply_mechanical  <<<"$text")"
   text="$(_convert_known_semantics <<<"$text")"
   text="$(_fix_header     <<<"$text")"
