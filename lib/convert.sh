@@ -1302,11 +1302,15 @@ _tochar_date() {
         arg1=trim(A[1]); arg2=trim(A[2])
         # 第二参数须是字符串字面量（日期掩码）
         if(substr(arg2,1,1)!=q) { out=out substr(line,1,epos); line=substr(line,epos+1); continue }
+        # 检测是否在动态 SQL 字符串内（掩码用 '' 转义，即开头是 ''）
+        dq = (substr(arg2,1,2) == q q)
         m=arg2; gsub(q,"",m)
         mm=mapmask(m)
         if(mm==m){ out=out substr(line,1,epos); line=substr(line,epos+1); continue }  # 无日期 token → 跳过，继续扫描后续
         fn=(substr(kw,1,6)=="TO_DAT") ? "STR_TO_DATE" : "DATE_FORMAT"
-        rep=fn "(" arg1 ", " q mm q ")"
+        # 动态 SQL 内保持 '' 转义，否则用单引号
+        qq = dq ? (q q) : q
+        rep=fn "(" arg1 ", " qq mm qq ")"
         out=out substr(line,1,pos-1) rep
         line=substr(line,epos+1)
       }
