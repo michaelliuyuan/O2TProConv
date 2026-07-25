@@ -655,6 +655,7 @@ _strip_gbk_comments() {
   sed -E \
     -e 's/[^[:print:][:space:]]//g' \
     -e 's/[[:space:]]*-*--[[:space:]]*$//' \
+    -e 's/--([^[:space:]\/-])/-- \1/g' \
     -e '/^[[:space:]]*\/\*[[:space:]]*$/d' \
     -e '/^[[:space:]]*\*\/[[:space:]]*$/d' \
     -e '/^[[:space:]]*--[[:space:]]*$/d'
