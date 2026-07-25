@@ -3,3 +3,5 @@ converted/
 reports/
 ora2tidb.conf
 *.log
+.p0-test-staging/
+$ROOT_DIR/
