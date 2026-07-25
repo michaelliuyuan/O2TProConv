@@ -647,11 +647,24 @@ _cleanup_ref_cursor() {
   printf '%s' "$text"
 }
 
+# Strip GBK-encoded comments that break TiDB's UTF-8 parser.
+# Handles both /* */ block comments and -- line comments containing non-ASCII bytes.
+# Runs early (before _apply_mechanical) to prevent downstream parsing failures.
+_strip_gbk_comments() {
+  sed -E \
+    -e '/\/\*/,/\*\// { /[^[:print:][:space:]]/d; }' \
+    -e '/^[[:space:]]*\/\*[[:space:]]*$/d' \
+    -e '/^[[:space:]]*\*\/[[:space:]]*$/d' \
+    -e '/^[[:space:]]*--.*[^[:print:][:space:]]/s/.*//' \
+    -e 's/[[:space:]]*-*--[[:space:]]*[^[:print:][:space:]].*$//'
+}
+
 # 转换单个文件
 convert_one() {
   local in="$1" out="$2"
   local text; text="$(cat "$in")"
   text="$(_tochar_date       <<<"$text")"
+  text="$(_strip_gbk_comments <<<"$text")"
   text="$(_resolve_anchor_type <<<"$text")"
   text="$(_resolve_rowtype   <<<"$text")"
   text="$(_apply_mechanical  <<<"$text")"
@@ -809,6 +822,9 @@ _emit_fn_stub() {
 
 # 机械转换：安全的、确定性的 token / 模式替换（GNU sed，支持 \b 与 I 标志）。
 _apply_mechanical() {
+  # 预处理：删除含 GBK 乱码字节的 /* */ 块注释行 + 残留的孤立 /* 或 */ 行
+  sed -E '/\/\*/,/\*\// { /[^[:print:][:space:]]/d; }' | \
+  sed -E '/^[[:space:]]*\/\*[[:space:]]*$/d; /^[[:space:]]*\*\/[[:space:]]*$/d' | \
   sed -E \
     -e '/^[[:space:]]*--.*[^[:print:][:space:]]/s/.*//' \
     -e '/^[[:space:]]*--/b' \
