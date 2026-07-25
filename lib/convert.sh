@@ -803,6 +803,7 @@ _emit_fn_stub() {
 _apply_mechanical() {
   sed -E \
     -e '/^[[:space:]]*--/b' \
+    -e 's/[[:space:]]*---[[:space:]]*[^[:print:][:space:]].*$//' \
     -e 's/\bNVARCHAR2[ \t]*\(/NVARCHAR(/gI' \
     -e 's/\bNVARCHAR2\b/NVARCHAR(4000)/gI' \
     -e 's/\bVARCHAR2[ \t]*\(/VARCHAR(/gI' \
