@@ -602,11 +602,19 @@ _cleanup_ref_cursor() {
   local cursor_var
   cursor_var="$(printf '%s\n' "$text" | sed -nE 's/.*OPEN ([A-Za-z_][A-Za-z0-9_]*) FOR.*已转为 PREPARE.*/\1/p' | head -1)"
   if [[ -n "$cursor_var" ]]; then
-    # 1. 删除参数列表中的 OUT <cursor_var> <TYPE> 参数（处理尾逗号）
-    # 模式: ..., OUT cursor_var TYPE) → ...)
+    # 1. 删除参数列表中的 OUT <cursor_var> <TYPE> 参数（处理尾逗号 + 补 ) 闭合）
+    # 模式 A: 同行 ..., OUT cursor_var TYPE) → ...)
     text="$(printf '%s\n' "$text" | sed -E "s/,[[:space:]]*OUT[[:space:]]+${cursor_var}[[:space:]]+[A-Za-z_][A-Za-z0-9_]*([[:space:]]*\))/\1/g")"
-    # 模式: 独占行 OUT cursor_var TYPE) → 删除整行，上一行参数的尾逗号在 _param_mode 已处理
-    text="$(printf '%s\n' "$text" | sed -E "/^[[:space:]]*OUT[[:space:]]+${cursor_var}[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\)/d")"
+    # 模式 B: 独占行 OUT cursor_var TYPE)
+    # 先找到独占行行号，修复上一行尾逗号 + 补 )，再删除独占行
+    local out_line
+    out_line="$(printf '%s\n' "$text" | grep -nE "^[[:space:]]*OUT[[:space:]]+${cursor_var}[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\)" | head -1 | cut -d: -f1)"
+    if [[ -n "$out_line" ]]; then
+      # 上一行去尾逗号 + 补 )
+      text="$(printf '%s\n' "$text" | sed -E "$((out_line-1))s/,[[:space:]]*$/)/")"
+      # 删除独占行 OUT 参数
+      text="$(printf '%s\n' "$text" | sed -E "${out_line}d")"
+    fi
     # 2. 双重执行合并：删除 EXECUTE IMMEDIATE 残留的 PREPARE/EXECUTE/DEALLOCATE 块
     # 2. 双重执行合并：删除 EXECUTE IMMEDIATE 残留的 SET/PREPARE/EXECUTE/DEALLOCATE 块
     #    从 OPEN FOR TODO 行向前搜索，找到紧邻的 SET/PREPARE/EXECUTE/DEALLOCATE 4 行块
@@ -808,6 +816,7 @@ _apply_mechanical() {
     -e 's/\bNVARCHAR2\b/NVARCHAR(4000)/gI' \
     -e 's/\bVARCHAR2[ \t]*\(/VARCHAR(/gI' \
     -e 's/\bVARCHAR2\b/VARCHAR(4000)/gI' \
+    -e 's/VARCHAR[(]32767[)]/TEXT/gI' \
     -e 's/\bRAW[ \t]*\(/VARBINARY(/gI' \
     -e 's/\bNUMBER\(/DECIMAL(/gI' \
     -e 's/\bNUMBER\b/DECIMAL(65,30)/gI' \
