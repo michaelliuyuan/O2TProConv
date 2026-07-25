@@ -27,8 +27,9 @@
 | 7 | `_rewrite_header` | `CREATE OR REPLACE` → `DROP IF EXISTS`+`CREATE`；FUNCTION 头 `RETURN<type>`→`RETURNS<type>` |
 | 8 | `_param_mode` | 参数模式前置（`name IN type`→`IN name type`）；FUNCTION 参数剥 `IN/OUT` |
 | 9 | `_restructure` | 结构改写：删 `AS/IS`、`:=` 两态、DECLARE 序重排、EXCEPTION→EXIT handler、显式游标、WHILE/FOR/CONTINUE |
-| 10 | `_convert_type_aware` | 类型推断（symtab）：TRUNC/INSTR/TO_NUMBER/TO_CHAR(num)/SUBSTR/NEXTVAL 按变量类型自动转换 |
+| 10 | `_convert_type_aware` | 类型推断（symtab）：TRUNC/INSTR/TO_NUMBER/TO_CHAR(num)/SUBSTR/NEXTVAL 按变量类型自动转换；嵌套 TO_CHAR(date,'mask')→DATE_FORMAT |
 | 11 | `_cleanup_ref_cursor` | P2-d：REF CURSOR OUT 参数删除 + 双重执行合并 |
+| 12 | `_convert_custom_functions` | P3-e：自定义函数自动迁移——扫描 FUNC_xxx() 调用 → 查 `_function_sources/*.fnc` → 递归 convert_one → 输出完整 TiDB `CREATE FUNCTION` DDL |
 
 **三层 + 一条原则**：
 
@@ -47,6 +48,8 @@ bash ≥ 4；Oracle 侧 `sqlplus`/`sqlcl`；TiDB 侧 `mysql`；**GNU `sed`/`gawk
 > - convert 重度依赖 GNU sed + gawk；compare 多处用 awk（仅校验 gawk）。export/capability 不依赖这两个工具。
 
 > **`%TYPE` 锚定类型解析（schema 内省）**：export 阶段会额外拉 `all_tab_columns`（owner/table_name/column_name/data_type/data_length/data_precision/data_scale/nullable）→ `exported/_schema_columns.tsv`，convert 的 `_resolve_anchor_type` pass 据此将 `table.column%TYPE` 解析为具体类型。**离线 fallback**：无 Oracle 连接（仅 convert 已导出文件）或列未匹配时，`%TYPE` 降级回 `-- TODO`（不臆造，保「离线可用」）。需要 export 用户对 `all_tab_columns` 有 SELECT 权限。
+
+> **P3-e 自定义函数源码导出（`all_source`）**：export 阶段会额外拉 `all_source WHERE type='FUNCTION'` → `exported/_function_sources/<owner>.<name>.fnc`，convert 阶段递归转换为完整 TiDB `CREATE FUNCTION` DDL。**非阻塞降级**：权限不足或无函数时 warn 跳过，不影响 export 主流程；无 `.fnc` 时 convert 降级为 DDL 桩 + TODO。需要 export 用户对 `all_source` 有 SELECT 权限（通常与 `all_tab_columns` 同权限）。
 
 ## 目录结构
 
@@ -306,6 +309,7 @@ DELIMITER ;
 | 性能 | 报告产出 ✅ |
 | **P0 回归** | **P0-1/2/3 全部通过** ✅（基于 `0aa08da`）：P0-3 LISTAGG 跨行 3 种形态正确标记 TODO + 单行 GROUP_CONCAT 两端一致；P0-1 自定义异常分支注释化保留+标记 TODO；P0-2 标识符碰撞 gsub 修复后用户变量不误替换 + 两端 CALL 一致；基线 27 SP snapshot-diff 零回归 |
 | P0 新增 6 SP | 6 个 P0 专项测试 SP 转换 + 两端 CALL 验证通过 ✅ |
+| **P2 + P3-e** | **PKG_CB_LIST_CB.pck 生产级 PACKAGE：113 TODO → 0** ✅（基于 `1f2ef44`）：P2-a~g（`||` 扫描器/SQL 字符串 `||`/跨行 DECODE/REF CURSOR/TO_DATE 增强/函数桩/SUBSTR）+ 嵌套 DECODE + 动态 SQL LISTAGG + 嵌套 TO_CHAR + P3-e（自定义函数 `all_source` 递归迁移），1168 行输出，0 TODO，61 INFO |
 
 > **历史基线**：M2 阶段单次连贯 33/33 @ `c9c2718`（Route A，11 SP：T1×16 + T2×17）。P1 功能扩展（`%TYPE`/游标 FOR/EXECUTE IMMEDIATE/LISTAGG/REVERSE FOR）+ Bug #1-6 修复后，基线为 33/33 CREATE + 17/17 两端 CALL 一致（基于 `42464c5`）。P0 正确性修复（LISTAGG 跨行/自定义异常/标识符碰撞）后，基线升级为 `0aa08da`：27 基线 SP 零回归 + 6 P0 专项 SP 通过。
 
@@ -349,15 +353,15 @@ DELIMITER ;
 - **M1** export 模块 + TiDB SP 能力验证 — ✅ 代码就绪 + 能力探针实跑通过（TiDB v7.1.9，含 GET DIAGNOSTICS 实证）
 - **M2** convert 规则引擎 + 转换置信度报告 — ✅ 机械规则 + **结构层**（EXCEPTION→EXIT handler / 显式游标 / WHILE→DO / 数值 FOR→WHILE+计数器 / CONTINUE→ITERATE / `:=`→SET / DECLARE 序重排 / END 规范）+ 忠实 `||`/`DECODE`(`<=>`) + `TO_CHAR(date)`→`DATE_FORMAT` + 报告（含默认长度 NOTE）；**T1+T2 验收通过（8/8 CREATE + golden + 一致性）**；DATE→DATETIME / 嵌套块 / T3 族 deferred（标 TODO）
 - **M3** compare harness — ✅ 用例契约 + `--validate-cases` 离线校验 + `--run` 执行对比（CALL/归一/diff/perf p50/p99/报告）
-- **M4** 一键 `all` + 加固
+- **M4** 一键 `all` + 加固 — ✅ P2 生产级转换（`||` 字符扫描器/跨行 DECODE/REF CURSOR/TO_DATE 增强/嵌套 DECODE/动态 SQL LISTAGG/嵌套 TO_CHAR）+ P3-e 自定义函数自动迁移；**PKG_CB_LIST_CB.pck 113 TODO → 0**（真实生产级 PACKAGE，100% 自动转换）
 
 ## 转换覆盖（诚实边界，详见设计文档 §5）
 
 **自动转换（机械 + 结构 + 忠实语义）**：
 - 类型：`VARCHAR2→VARCHAR`、`NVARCHAR2→NVARCHAR`（裸类型给安全默认长度 `VARCHAR(4000)`）、`NUMBER(p,s)→DECIMAL(p,s)`、裸 `NUMBER→DECIMAL(65,30)`、`PLS_INTEGER/BINARY_INTEGER→INT`、`RAW(n)→VARBINARY(n)`
 - 锚定类型 `%TYPE`：`table.column%TYPE` / `owner.table.column%TYPE` → 查 `exported/_schema_columns.tsv` 替换为 Oracle 原生类型（如 `NUMBER(6,0)`），再经机械层统一转 MySQL（如 `DECIMAL(6,0)`）；`column%TYPE`（无表前缀）由 `_convert_type_aware` symtab 解析。无 schema 数据或列未匹配 → 降级 TODO
-- 内置：`NVL→IFNULL`、`SYSDATE→NOW()`、`SYSTIMESTAMP→CURRENT_TIMESTAMP(6)`、`TO_CHAR(date,'mask')→DATE_FORMAT`、`TO_DATE(str,'mask')→STR_TO_DATE`、`LENGTH→CHAR_LENGTH`、`CHR→CHAR`、`SYS_GUID()→UUID()`⚠️、`NVL2(a,b,c)→IF(a IS NOT NULL,b,c)`⚠️、`ADD_MONTHS(d,n)→DATE_ADD(d,INTERVAL n MONTH)`、`MONTHS_BETWEEN(a,b)→TIMESTAMPDIFF(MONTH,b,a)`⚠️参数反转、`ELSIF→ELSEIF`
-- 忠实语义：`a||b→NULLIF(CONCAT(IFNULL(a,''),IFNULL(b,'')),'')`（简单链，NULL 安全）、`DECODE(e,s1,r1,..,def)→CASE WHEN e<=>s1 THEN r1 .. ELSE def END`（`<=>` null-safe）、`LISTAGG(expr,sep) WITHIN GROUP(ORDER BY sortcol)→GROUP_CONCAT(expr ORDER BY sortcol SEPARATOR sep)`（无 separator 默认空串；`LISTAGG OVER(PARTITION BY..)` 分析函数形式标 TODO——MySQL GROUP_CONCAT 不支持；**跨行 OVER 漏检见下方已知限制**）
+- 内置：`NVL→IFNULL`、`SYSDATE→NOW()`、`SYSTIMESTAMP→CURRENT_TIMESTAMP(6)`、`TO_CHAR(date,'mask')→DATE_FORMAT`（含嵌套 `TO_CHAR` 自动转换）、`TO_DATE(str,'mask')→STR_TO_DATE`（**P2-e**：`match_paren`+`split_topcomma` 支持含 `||`/逗号/括号的复杂参数）、`LENGTH→CHAR_LENGTH`、`CHR→CHAR`、`SYS_GUID()→UUID()`⚠️、`NVL2(a,b,c)→IF(a IS NOT NULL,b,c)`⚠️、`ADD_MONTHS(d,n)→DATE_ADD(d,INTERVAL n MONTH)`、`MONTHS_BETWEEN(a,b)→TIMESTAMPDIFF(MONTH,b,a)`⚠️参数反转、`INSTR(s,sub)→LOCATE(sub,s)`（参数交换）、`TRUNC(n)→TRUNCATE(n,0)`/`TRUNC(n,d)→TRUNCATE(n,d)`、`TO_NUMBER→CAST`、`SUBSTR` 透传（Oracle/TiDB 均 1-based）、`ELSIF→ELSEIF`
+- 忠实语义：`a||b→NULLIF(CONCAT(IFNULL(a,''),IFNULL(b,'')),'')`（**P2-a 字符级扫描器** `scan_concat`，含 `''` 转义/函数调用/跨行的拼接链自动转，NULL 安全）、`DECODE(e,s1,r1,..,def)→CASE WHEN e<=>s1 THEN r1 .. ELSE def END`（`<=>` null-safe；**P2-c 跨行归一化** + **任意层级嵌套 DECODE 自动转换**）、`LISTAGG(expr,sep) WITHIN GROUP(ORDER BY sortcol)→GROUP_CONCAT(expr ORDER BY sortcol SEPARATOR sep)`（无 separator 默认空串；**P2 后续**：动态 SQL 字符串值内 `LISTAGG(col, '','')` 的 `''` 转义正确处理；`LISTAGG OVER(PARTITION BY..)` 分析函数形式标 TODO——MySQL GROUP_CONCAT 不支持）
 - ⚠️ **语义差异 NOTE**（已转但有已知差，转换报告「语义差异 NOTE」段列出，需核对）：`SYS_GUID()→UUID()`（Oracle 32-hex 无连字符 vs MySQL 36 带连字符）、`MONTHS_BETWEEN→TIMESTAMPDIFF`（Oracle 小数月 vs MySQL 整数月截断）、`NVL2→IF`（Oracle `''≡NULL` vs MySQL `''≠NULL`，空串路径分歧）。裸 `NUMBER→DECIMAL(65,30)` 安全兜底导致显示精度差（Oracle `55` vs TiDB `55.000...0`，30 位小数）——值相同但字符串表示不同，若数值参与字符串拼接（如 `salary=2850` vs `2850.00`）下游字符串比较会受影响；compare 契约的 `numeric_scale` 归一可处理，或源码用 `NUMBER(p,s)` 精确声明。
 - 结构：EXCEPTION 块→`EXIT HANDLER`（NO_DATA_FOUND→`FOR NOT FOUND`、OTHERS→`FOR SQLEXCEPTION`+`GET DIAGNOSTICS`+`SQLERRM→v_errmsg`）；显式游标 `CURSOR c IS`→`DECLARE c CURSOR FOR`（+done 标志 + `CONTINUE HANDLER FOR NOT FOUND` + label + `EXIT WHEN c%NOTFOUND`→`IF done=1 THEN LEAVE`；**复合条件保留**：`EXIT WHEN c%NOTFOUND OR cond`→`IF done=1 OR cond THEN LEAVE`，仅替换 `%NOTFOUND` 标记不丢弃其余条件）；游标 `FOR rec IN c LOOP`→`OPEN c` + `label:LOOP` + `FETCH c INTO rec`（**FETCH INTO 标 TODO：MySQL 无 RECORD 类型，需人工展开为标量变量列表**）+ done check + body + `END LOOP label` + `CLOSE c`（半自动）；`EXECUTE IMMEDIATE 'sql' [USING ..]`→`SET @sql=..; PREPARE stmt FROM @sql; EXECUTE stmt [USING ..]; DEALLOCATE PREPARE stmt;`（**INTO 子句标 TODO：MySQL PREPARE 无单行 SELECT 返回，需改游标**）（半自动）；`WHILE..LOOP`→`WHILE..DO`；数值 `FOR v IN lo..hi LOOP`→`DECLARE v INT DEFAULT lo; WHILE v<=hi DO`（+计数器递增）；`FOR v IN REVERSE lo..hi LOOP`→`DECLARE v INT DEFAULT hi; WHILE v>=lo DO`（计数器递减）；`CONTINUE`→`ITERATE label`（forward FOR 内前置递增防死循环；REVERSE FOR 内前置递减防死循环；游标 FOR 内直接 ITERATE，FETCH 在循环顶自动推进）；`:=`→`SET`/`DEFAULT`；DECLARE 序重排（变量/条件→游标→handler）；头部 `CREATE OR REPLACE`→`DROP IF EXISTS`+`CREATE`、双引号→反引号、去 owner 前缀、`RETURN<type>→RETURNS<type>`；去 Oracle `/` 终止行；`DELIMITER //` 包裹；嵌套 `DECLARE..BEGIN..END`（简单块→MySQL `BEGIN..END`，含 EXCEPTION 的标 TODO）。
 
@@ -368,6 +372,10 @@ DELIMITER ;
 > **FOR 计数器自动 DECLARE**：Oracle 的 FOR 循环变量（`FOR v IN lo..hi` / `FOR v IN REVERSE lo..hi` 的 `v`）是**隐式声明**的。转换器 assemble 阶段会自动注入 `DECLARE v INT DEFAULT <lo 或 hi>;`（forward 初始化=`lo`，REVERSE 初始化=`hi`）——无论源码中 `v` 是否显式 DECLARE。已显式声明的不会重复注入。
 
 **PACKAGE BODY 拆分**：export 默认导出 PACKAGE BODY（`EXPORT_OBJECT_TYPES` 含 `PACKAGE BODY`），convert 阶段 `_split_package_body` 检测 `CREATE OR REPLACE PACKAGE BODY` → 自动提取内部 PROCEDURE/FUNCTION 为独立 `.sql` 分别转换，PACKAGE 级变量/类型/游标声明不随子程序迁移（需人工，见 FAQ）。PACKAGE spec（仅声明）导出但不自动转换。
+
+**P2-d REF CURSOR 处理**：`TYPE x IS REF CURSOR` 声明自动删除；`OPEN cursor FOR sql_expr` → `SET @sql / PREPARE / EXECUTE / DEALLOCATE`；REF CURSOR OUT 参数自动清理；双重执行（`EXECUTE IMMEDIATE V_SQL` + `OPEN cursor FOR V_SQL`）自动合并，TODO 提醒人工移除冗余执行。
+
+**P3-e 自定义函数自动迁移**：export 阶段新增步骤——查 `all_source WHERE type='FUNCTION'` 拉 Oracle 函数源码 → `exported/_function_sources/<owner>.<name>.fnc`（每个函数一个文件，非阻塞：权限不足 warn 降级不阻断主流程）。convert 阶段 `_convert_custom_functions` 扫描所有 `.tidb.sql` 输出中的 `FUNC_xxx(` 调用 → 全局去重 → 查 `.fnc` 文件 → 注入 `CREATE OR REPLACE` 前缀 → 递归 `convert_one`（复用全 pipeline）→ 输出完整 TiDB `CREATE FUNCTION` DDL 到 `converted/_custom_functions.tidb.sql`。**三级降级**：`.fnc` 存在且转换成功 → 完整 DDL；`.fnc` 存在但转换失败 → DDL 桩 + TODO；`.fnc` 不存在 → DDL 桩 + TODO。
 
 **覆盖率**：T1+T2 常见 SP 定义 8/8 全自动转换（corpus 实测 CREATE + golden + 一致性通过）；复杂 T3（`%ROWTYPE` / BULK COLLECT / 集合 / 内联游标 FOR）标 `-- TODO` 走人工（`%TYPE` 已支持自动解析；游标 `FOR rec IN cur LOOP` 半自动：OPEN/FETCH/CLOSE 框架自动，FETCH INTO 展开标 TODO；`EXECUTE IMMEDIATE` 半自动：PREPARE/EXECUTE/DEALLOCATE 框架自动，INTO 子句标 TODO）；PACKAGE BODY 自动拆分+转换。**诚实边界**：纯正则无法区分字符串字面量与代码、无法处理嵌套，强行转换比「提示人工」更坏——不可靠处留 `-- TODO`，均不臆造。转换报告含 **TODO 明细**段（按 `文件:L行号` 定位每条 TODO 原因），便于人工直接跳转处理，无需手动 grep 输出文件。
 
@@ -406,7 +414,12 @@ DELIMITER ;
 - [x] **P2-f**：自定义函数 DDL 桩注入（`FUNC_GET_VARCHAR`/`FUNC_dsensitive_permissions` → INFO + CREATE FUNCTION 模板）（33→11）
 - [x] **P2-g**：SUBSTR 变量 start 降级（Oracle/TiDB 均 1-based，透传不标 TODO）
 - [x] P2 回归验证通过（`PKG_CB_LIST_CB.pck`：113 TODO → 11，27 SP 语料库零回归）
-- [ ] deferred：T3 族（%ROWTYPE·BULK COLLECT·集合·内联游标 FOR 自动转换）、GOTO→unsupported TODO、动态 SQL 字符串值内残留深度解析
+- [x] **嵌套 DECODE 修复**：`conv_decode` 转换结果放回 `line` 重扫，捕获任意层级嵌套 DECODE（11→9）
+- [x] **动态 SQL 内 LISTAGG `''` 转义**：`conv_listagg` n==3 特殊处理，`'',''` 转义形式正确保留（9→5）
+- [x] **嵌套 TO_CHAR 修复**：`conv_to_char_num` 加 `mapmask` 判断，嵌套 `TO_CHAR(date,'mask')`→`DATE_FORMAT`（9→7→配合 P3-e 最终归零）
+- [x] **P3-e：自定义函数自动迁移** — export 拉 `all_source` 函数源码（`_function_sources/*.fnc`）+ convert 递归 `convert_one` 转完整 TiDB `CREATE FUNCTION` DDL + 三级降级链（1→0）
+- [x] **PKG_CB_LIST_CB 生产级验证**：真实生产 PACKAGE 113 TODO → **0**（100% 自动转换）
+- [ ] deferred：T3 族（%ROWTYPE·BULK COLLECT·集合·内联游标 FOR 自动转换）、GOTO→unsupported TODO、动态 SQL 字符串值内残留深度解析（P3-a 储备）
 
 ## 常见问题（FAQ）
 
