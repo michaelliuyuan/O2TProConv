@@ -572,22 +572,23 @@ _resolve_rowtype() {
 
       # 对已收集的 %ROWTYPE 变量做引用替换
       line_done = 0
+      str_todo = ""
       for (vn in rowtype_var) {
-        # 1) 动态 SQL 字符串内含 v_name.col → 标 TODO 不替换
+        # 1) 动态 SQL 字符串内含 v_name.col → 标 TODO 不替换该变量
         if (str_has_dot(line, vn)) {
-          if (!line_done) {
-            print "-- TODO(需人工转换): 动态 SQL 字符串内 " vn ".column 引用需人工展开为逐字段变量"
-            print line
-            line_done = 1
-          }
-          break
+          if (str_todo == "") str_todo = vn
+          else str_todo = str_todo "," vn
+          continue
         }
         # 2) 代码层 v_name.col → v_name_col（引号感知）
         if (code_has_dot(line, vn)) {
           line = code_replace_dot(line, vn)
         }
       }
-      if (!line_done) print line
+      if (str_todo != "") {
+        print "-- TODO(需人工转换): 动态 SQL 字符串内 " str_todo ".column 引用需人工展开为逐字段变量"
+      }
+      print line
     }
   '
 }
