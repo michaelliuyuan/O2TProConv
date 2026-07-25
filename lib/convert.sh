@@ -647,16 +647,17 @@ _cleanup_ref_cursor() {
   printf '%s' "$text"
 }
 
-# Strip GBK-encoded comments that break TiDB's UTF-8 parser.
-# Handles both /* */ block comments and -- line comments containing non-ASCII bytes.
-# Runs early (before _apply_mechanical) to prevent downstream parsing failures.
+# Strip GBK-encoded comment bytes that break TiDB's UTF-8 parser.
+# Strategy: strip non-ASCII bytes IN-PLACE (never delete entire lines) to preserve
+# code structure (e.g. DECODE multi-line args between /* */ blocks).
+# Also clears pure-comment lines that become empty after stripping.
 _strip_gbk_comments() {
   sed -E \
-    -e '/\/\*/,/\*\// { /[^[:print:][:space:]]/d; }' \
+    -e 's/[^[:print:][:space:]]//g' \
+    -e 's/[[:space:]]*-*--[[:space:]]*$//' \
     -e '/^[[:space:]]*\/\*[[:space:]]*$/d' \
     -e '/^[[:space:]]*\*\/[[:space:]]*$/d' \
-    -e '/^[[:space:]]*--.*[^[:print:][:space:]]/s/.*//' \
-    -e 's/[[:space:]]*-*--[[:space:]]*[^[:print:][:space:]].*$//'
+    -e '/^[[:space:]]*--[[:space:]]*$/d'
 }
 
 # 转换单个文件
