@@ -1141,7 +1141,9 @@ _convert_known_semantics() {
         if(n==3 && A[2]==q q && A[3]==q q){ n=2; A[2]=q q "," q q }
         if(n<1 || n>2){ out=out substr(line,1,epos); line=substr(line,epos+1); continue }
         expr=trim(A[1])
-        sep=(n==2 ? trim(A[2]) : q q)
+        has_sep=(n==2)
+        sep=(has_sep ? trim(A[2]) : q q)
+        sep_clause=(has_sep ? " SEPARATOR " sep : "")
         rest=substr(line,epos+1)
         # 必须跟 WITHIN GROUP (ORDER BY ...)
         if(match(rest,/^[ \t]*WITHIN[ \t]+GROUP[ \t]*\(/)){
@@ -1163,8 +1165,8 @@ _convert_known_semantics() {
             todo=todo "LISTAGG OVER(PARTITION BY) 分析函数 MySQL GROUP_CONCAT 不支持，需人工; "
             out=out substr(line,1,epos); line=rest; continue
           }
-          # 生成 GROUP_CONCAT(expr ORDER BY orderby SEPARATOR sep)
-          repl="GROUP_CONCAT(" expr " ORDER BY " orderby " SEPARATOR " sep ")"
+          # 生成 GROUP_CONCAT(expr ORDER BY orderby [SEPARATOR sep])
+          repl="GROUP_CONCAT(" expr " ORDER BY " orderby sep_clause ")"
           out=out substr(line,1,pos-1) repl
           line=substr(rest, wg_end+1)
         } else {
@@ -1174,11 +1176,8 @@ _convert_known_semantics() {
             todo=todo "LISTAGG OVER(PARTITION BY) 分析函数 MySQL GROUP_CONCAT 不支持，需人工; "
             out=out substr(line,1,epos); line=rest; continue
           }
-          if (expr ~ /^[ \t]*DISTINCT[ \t]+/i) {
-            repl="GROUP_CONCAT(" expr " SEPARATOR " sep ")"
-          } else {
-            repl="GROUP_CONCAT(" expr " SEPARATOR " sep ")"
-          }
+          repl="GROUP_CONCAT(" expr sep_clause ")"
+          if (!has_sep) todo=todo "LISTAGG 无分隔符: MySQL GROUP_CONCAT 默认逗号(vs Oracle 空串), 动态 SQL 内省略 SEPARATOR 避免引号转义; "
           out=out substr(line,1,pos-1) repl
           line=rest
         }
