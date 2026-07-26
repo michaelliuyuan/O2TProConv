@@ -652,7 +652,15 @@ _cleanup_ref_cursor() {
 # code structure (e.g. DECODE multi-line args between /* */ blocks).
 # Also clears pure-comment lines that become empty after stripping.
 _strip_gbk_comments() {
-  sed -E \
+  local text; text="$(cat)"
+  # If input is valid UTF-8 (no GBK corruption), skip all stripping —
+  # Chinese chars are legitimate printable characters in UTF-8.
+  if printf '%s' "$text" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+    printf '%s' "$text"
+    return 0
+  fi
+  # GBK or corrupted encoding — strip non-ASCII bytes as ? to preserve quote pairing
+  printf '%s' "$text" | sed -E \
     -e 's/[^[:print:][:space:]]/?/g' \
     -e 's/[[:space:]]*-*--[[:space:]]*$//' \
     -e 's/--([^[:space:]\/-])/-- \1/g' \
