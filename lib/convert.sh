@@ -960,8 +960,12 @@ _rename_reserved_kw() {
       line = $0
       # Pattern: [) or identifier] [AS] KW ON
       # Use [A-Za-z0-9_).] to allow: closing paren, table name, schema.table
-      while (match(line, /[A-Za-z0-9_).][ \t]+(AS[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]+ON\b/)) {
+      while (match(line, /[A-Za-z0-9_).][ \t]+(AS[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]+ON/)) {
         seg = substr(line, RSTART, RLENGTH)
+        # Verify word boundary after ON (next char must be non-word or EOL)
+        after_on_pos = RSTART + RLENGTH
+        after_on = substr(line, after_on_pos, 1)
+        if (after_on != "" && after_on ~ /[A-Za-z0-9_]/) { line = substr(line, RSTART + 1); continue }
         # Extract the KW between the preceding token and ON
         # Strip leading token + whitespace
         sub(/^[A-Za-z0-9_).]+[ \t]+/, "", seg)
@@ -971,7 +975,7 @@ _rename_reserved_kw() {
         if (seg_up in is_reserved) {
           confirmed[seg_up] = seg
         }
-        line = substr(line, RSTART + RLENGTH)
+        line = substr(line, after_on_pos)
       }
       next
     }
@@ -990,27 +994,29 @@ _rename_reserved_kw() {
           # e.g. ... LEFT JOIN (...) MOD ON MOD.X ... inside V_SQL
           # or   ... JOIN TABLE_NAME MOD ON MOD.X ... inside V_SQL
           # Try "KW ON" where KW is confirmed — look for preceding ) or identifier
-          if (c ~ /[A-Za-z_)/) {
+          if (index("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_)", c) > 0) {
             # Check if this position starts a confirmed "preceding [AS] KW ON"
-            m = match(substr(rest, i), /^[A-Za-z0-9_).][ \t]+(AS[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]+ON\b/)
+            m = match(substr(rest, i), /^[A-Za-z0-9_).][ \t]+(AS[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]+ON/)
             if (m > 0) {
-              seg = substr(rest, i, RLENGTH)
-              tmp = seg
-              has_as = (tmp ~ /[ \t]+AS[ \t]+/i)
-              # Strip leading token + whitespace
-              sub(/^[A-Za-z0-9_).]+[ \t]+/, "", tmp)
-              sub(/^[Aa][Ss][ \t]+/, "", tmp)
-              sub(/[ \t]+ON$/, "", tmp)
-              tmp_up = toupper(tmp)
-              if (tmp_up in confirmed) {
-                # Preserve leading token, rename KW to KW_
-                lead = seg; sub(/[ \t]+(AS[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]+ON\b.*$/, "", lead)
-                if (has_as)
-                  out = out lead " AS " tmp "_ ON"
-                else
-                  out = out lead " " tmp "_ ON"
-                i += RLENGTH
-                continue
+              # Verify word boundary after ON
+              _after = substr(rest, i + RLENGTH, 1)
+              if (_after == "" || _after !~ /[A-Za-z0-9_]/) {
+                seg = substr(rest, i, RLENGTH)
+                tmp = seg
+                has_as = (tmp ~ /[ \t]+AS[ \t]+/i)
+                sub(/^[A-Za-z0-9_).]+[ \t]+/, "", tmp)
+                sub(/^[Aa][Ss][ \t]+/, "", tmp)
+                sub(/[ \t]+ON$/, "", tmp)
+                tmp_up = toupper(tmp)
+                if (tmp_up in confirmed) {
+                  lead = seg; sub(/[ \t]+(AS[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]+ON$/, "", lead)
+                  if (has_as)
+                    out = out lead " AS " tmp "_ ON"
+                  else
+                    out = out lead " " tmp "_ ON"
+                  i += RLENGTH
+                  continue
+                }
               }
             }
           }
@@ -1043,24 +1049,27 @@ _rename_reserved_kw() {
           continue
         }
         # Try to match "preceding [AS] KW ON" at position i (code layer)
-        if (c ~ /[A-Za-z_)/]) {
-          m = match(substr(rest, i), /^[A-Za-z0-9_).][ \t]+(AS[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]+ON\b/)
+        if (index("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_)", c) > 0) {
+          m = match(substr(rest, i), /^[A-Za-z0-9_).][ \t]+(AS[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]+ON/)
           if (m > 0) {
-            seg = substr(rest, i, RLENGTH)
-            tmp = seg
-            has_as = (tmp ~ /[ \t]+AS[ \t]+/i)
-            sub(/^[A-Za-z0-9_).]+[ \t]+/, "", tmp)
-            sub(/^[Aa][Ss][ \t]+/, "", tmp)
-            sub(/[ \t]+ON$/, "", tmp)
-            tmp_up = toupper(tmp)
-            if (tmp_up in confirmed) {
-              lead = seg; sub(/[ \t]+(AS[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]+ON\b.*$/, "", lead)
-              if (has_as)
-                out = out lead " AS " tmp "_ ON"
-              else
-                out = out lead " " tmp "_ ON"
-              i += RLENGTH
-              continue
+            _after = substr(rest, i + RLENGTH, 1)
+            if (_after == "" || _after !~ /[A-Za-z0-9_]/) {
+              seg = substr(rest, i, RLENGTH)
+              tmp = seg
+              has_as = (tmp ~ /[ \t]+AS[ \t]+/i)
+              sub(/^[A-Za-z0-9_).]+[ \t]+/, "", tmp)
+              sub(/^[Aa][Ss][ \t]+/, "", tmp)
+              sub(/[ \t]+ON$/, "", tmp)
+              tmp_up = toupper(tmp)
+              if (tmp_up in confirmed) {
+                lead = seg; sub(/[ \t]+(AS[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]+ON$/, "", lead)
+                if (has_as)
+                  out = out lead " AS " tmp "_ ON"
+                else
+                  out = out lead " " tmp "_ ON"
+                i += RLENGTH
+                continue
+              }
             }
           }
         }
