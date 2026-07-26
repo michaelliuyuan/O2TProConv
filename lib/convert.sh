@@ -647,6 +647,40 @@ _cleanup_ref_cursor() {
   printf '%s' "$text"
 }
 
+# Strip -- inline comments inside dynamic SQL string literals.
+# When PREPARE executes a string containing '-- comment', the -- is treated as
+# a SQL comment at runtime, truncating the line. This pass removes -- comments
+# that appear inside string literals (tracked via in_str state machine with '' escape).
+# Code-level -- comments (outside strings) are preserved.
+_strip_dynsql_inline_comments() {
+  gawk '
+    BEGIN { q = sprintf("%c", 39); in_str = 0 }
+    {
+      line = $0
+      out = ""
+      n = length(line)
+      for (i = 1; i <= n; i++) {
+        c = substr(line, i, 1)
+        if (in_str) {
+          if (c == q) {
+            nx = substr(line, i+1, 1)
+            if (nx == q) { out = out c nx; i++; continue }
+            in_str = 0; out = out c; continue
+          }
+          if (c == "-" && substr(line, i+1, 1) == "-") {
+            break
+          }
+          out = out c
+        } else {
+          if (c == q) { in_str = 1 }
+          out = out c
+        }
+      }
+      print out
+    }
+  '
+}
+
 # Strip GBK-encoded comment bytes that break TiDB's UTF-8 parser.
 # Strategy: strip non-ASCII bytes IN-PLACE (never delete entire lines) to preserve
 # code structure (e.g. DECODE multi-line args between /* */ blocks).
@@ -688,6 +722,7 @@ convert_one() {
   text="$(_restructure    <<<"$text")"
   text="$(_convert_type_aware <<<"$text")"
   text="$(_cleanup_ref_cursor <<<"$text")"
+  text="$(_strip_dynsql_inline_comments <<<"$text")"
   {
     echo "-- 由 oracle2tidb-sp 自动转换生成；请核对带 -- TODO(需人工转换) 的行"
     # P2-b: 若输出含残留 ||（SQL 字符串值内或跨行未转），注入幂等 SET SESSION sql_mode
