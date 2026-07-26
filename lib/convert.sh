@@ -714,6 +714,7 @@ convert_one() {
   text="$(_resolve_anchor_type <<<"$text")"
   text="$(_resolve_rowtype   <<<"$text")"
   text="$(_apply_mechanical  <<<"$text")"
+  text="$(_rename_reserved_kw <<<"$text")"
   text="$(_convert_known_semantics <<<"$text")"
   text="$(_fix_header     <<<"$text")"
   text="$(_mark_complex   <<<"$text")"
@@ -895,13 +896,33 @@ _apply_mechanical() {
     -e 's/\bCHR[ \t]*\(/CHAR(/gI' \
     -e 's/\bSYS_GUID[ \t]*\(\)/UUID()/gI' \
     -e 's/\bELSIF\b/ELSEIF/gI' \
-    -e 's/[[:space:]]MOD[[:space:]]ON/ MOD_ ON/gI' \
-    -e 's/\bMOD\./MOD_./g' \
-    -e 's/^\/$//'                       # 去掉 Oracle 的 `/` 执行终止行
+    -e 's/^---/-- -/' \
+    -e 's/[[:space:]]---/ -- -/g' \
+    -e 's/^\/$/'                        # 去掉 Oracle 的 `/` 执行终止行
   # 说明：|| 与 DECODE 现由 _convert_known_semantics 做「忠实版自动转换」（已知语义差，默认开启）；
   #   转不了的（跨行/操作数边界不可靠）才注入 TODO。DATE(类型)/%TYPE/FOR..IN/
   #   BULK COLLECT/EXCEPTION/CURSOR..IS/DBMS_OUTPUT 仍由 _mark_complex 标人工。
   #   EXECUTE IMMEDIATE 现由 _restructure 半自动转 PREPARE/EXECUTE/DEALLOCATE。
+}
+
+# P5-d: MySQL/TiDB 保留关键字作为表/列别名时自动改名（加 _ 后缀）。
+# 只匹配两种上下文：
+#   1) `) KW ON` — JOIN 子查询的表别名 + ON 关键字
+#   2) `KW.` — 别名列引用（点号前缀）
+# 不误匹配函数调用 KW( 或更长的标识符 KWXYZ。
+# 保留字列表来自 MySQL 8.0 reserved words 中常见的 SP 别名。
+_rename_reserved_kw() {
+  local reserved="MOD CHECK CONDITION STATUS GROUP ORDER RANK LEVEL KEY READ \
+SIGNAL RESIGNAL MATCH REPEAT PARTITION WITHOUT WITHIN \
+OPTION ROLE ADMIN SYSTEM DATABASE USER SCHEMA TABLE COLUMN \
+INDEX VIEW TRIGGER EVENT NAME TYPE SIZE YEAR MONTH DAY \
+HOUR MINUTE SECOND LANGUAGE NUMBER PROCEDURE FUNCTION"
+  local kw sed_args=()
+  for kw in $reserved; do
+    sed_args+=(-e "s/\)[[:space:]]+${kw}[[:space:]]+ON\b/) ${kw}_ ON/gI")
+    sed_args+=(-e "s/\b${kw}\./${kw}_./gI")
+  done
+  sed -E "${sed_args[@]}"
 }
 
 # 已知 Oracle↔MySQL 语义差的忠实版自动转换（架构师决策：已知语义差→忠实修、默认开启；
@@ -1100,17 +1121,25 @@ _convert_known_semantics() {
       _concat_prefix=substr(s,1,chain_start-1)
       _concat_chain=substr(s,chain_start,chain_end-chain_start+1)
       _concat_suffix=substr(s,chain_end+1)
+      # P5-c: 检查链内字符串是否闭合（引号成对）——用于允许行末 || 链
+      _concat_chain_balanced=1
+      { nq=0; in_str=0; for(_i=1;_i<=length(_concat_chain);_i++){ _c=substr(_concat_chain,_i,1); if(in_str){ if(_c==q){ _nx=substr(_concat_chain,_i+1,1); if(_nx==q){ _i++; continue } else in_str=0 } continue } if(_c==q) in_str=1 } if(in_str) _concat_chain_balanced=0 }
       return 1
     }
     function conv_concat(line,   out,A,n,i,inner,cs,unsafe,ss,found){
       out=""
       while((found=scan_concat(line))){
         # suffix 须以 ;/) /, 终结（非裸 EOL）：裸 EOL = 多行续行
+        # P5-c: 但若 suffix 为空且 chain 内字符串已闭合，则允许行末 || 链
         if(_concat_suffix !~ /^[ \t]*[;),]/){
-          pipe_info=pipe_info "|| 跨行续行保留字面，依赖 PIPES_AS_CONCAT; "
-          out=out _concat_prefix _concat_chain
-          line=_concat_suffix
-          continue
+          if(_concat_suffix ~ /^[ \t]*$/ && _concat_chain_balanced){
+            # 允许：链完整且行末终止
+          } else {
+            pipe_info=pipe_info "|| 跨行续行保留字面，依赖 PIPES_AS_CONCAT; "
+            out=out _concat_prefix _concat_chain
+            line=_concat_suffix
+            continue
+          }
         }
         n=split_pipes(_concat_chain,A)
         if(n<2){ out=out _concat_prefix _concat_chain; line=_concat_suffix; continue }
@@ -1230,6 +1259,25 @@ _convert_known_semantics() {
       }
       return out line
     }
+    # P5-c: 检测未闭合的 || 字符串跨行——|| 后的字符串字面量未闭合，需缓冲后续行
+    function has_unclosed_concat(s,   n,i,c,in_str,nx,last_pipe_pos){
+      n=length(s); in_str=0; last_pipe_pos=0
+      for(i=1;i<=n;i++){
+        c=substr(s,i,1)
+        if(in_str){ if(c==q){ nx=substr(s,i+1,1); if(nx==q){ i++; continue } else in_str=0 } continue }
+        if(c==q){ in_str=1; continue }
+        if(c=="|" && i<n && substr(s,i+1,1)=="|"){ last_pipe_pos=i; i++; continue }
+      }
+      if(last_pipe_pos==0) return 0
+      # 检查 last_pipe_pos+2 之后是否有未闭合的字符串字面量
+      in_str=0
+      for(i=last_pipe_pos+2; i<=n; i++){
+        c=substr(s,i,1)
+        if(in_str){ if(c==q){ nx=substr(s,i+1,1); if(nx==q){ i++; continue } else in_str=0 } continue }
+        if(c==q){ in_str=1 }
+      }
+      return in_str  # 1 = 字符串未闭合
+    }
     function code_has_pipe(s,   n,i,c,depth,in_str,nx){
       n=length(s); depth=0; in_str=0
       for(i=1;i<=n;i++){
@@ -1271,6 +1319,17 @@ _convert_known_semantics() {
           _dj=_dj " " _dnx
         }
         line=_dj
+      }
+      # P5-c: 跨行 || 链归一化——检测未闭合的字符串字面量（|| 后字符串跨行），缓冲直到闭合
+      if(has_unclosed_concat(line)){
+        _cj=line; _cn=1
+        while(_cn < 20 && has_unclosed_concat(_cj)){
+          if((getline _cnx) <= 0) break
+          _cn++
+          if(_cnx ~ /^[ \t]*--/){ print _cnx; continue }
+          _cj=_cj " " _cnx
+        }
+        line=_cj
       }
       line=conv_decode(line)
       line=conv_concat(line)
