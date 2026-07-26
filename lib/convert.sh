@@ -898,7 +898,7 @@ _apply_mechanical() {
     -e 's/\bELSIF\b/ELSEIF/gI' \
     -e 's/^---/-- -/' \
     -e 's/[[:space:]]---/ -- -/g' \
-    -e 's/^\/$/'                        # 去掉 Oracle 的 `/` 执行终止行
+    -e 's/^\/$//'                       # 去掉 Oracle 的 `/` 执行终止行
   # 说明：|| 与 DECODE 现由 _convert_known_semantics 做「忠实版自动转换」（已知语义差，默认开启）；
   #   转不了的（跨行/操作数边界不可靠）才注入 TODO。DATE(类型)/%TYPE/FOR..IN/
   #   BULK COLLECT/EXCEPTION/CURSOR..IS/DBMS_OUTPUT 仍由 _mark_complex 标人工。
@@ -968,7 +968,7 @@ _rename_reserved_kw() {
       }
       next
     }
-    # Pass 2: rename only confirmed aliases (string-aware — skip string literals)
+    # Pass 2: rename only confirmed aliases (string-aware — in_str 内也对 confirmed 别名做替换)
     {
       out = ""
       rest = $0
@@ -978,6 +978,43 @@ _rename_reserved_kw() {
       while (i <= n) {
         c = substr(rest, i, 1)
         if (in_str) {
+          # In string literal: still check for confirmed alias patterns
+          # This handles dynamic SQL string values containing JOIN aliases
+          # e.g. ... LEFT JOIN (...) MOD ON MOD.X ... inside V_SQL
+          # Try ") [AS] KW ON" at position i
+          if (c == ")") {
+            m = match(substr(rest, i), /^\)[ \t]+(AS[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]+ON\b/)
+            if (m > 0) {
+              seg = substr(rest, i, RLENGTH)
+              tmp = seg
+              has_as = (tmp ~ /\)[ \t]+AS[ \t]+/i)
+              sub(/^\)[ \t]+/, "", tmp)
+              sub(/^[Aa][Ss][ \t]+/, "", tmp)
+              sub(/[ \t]+ON$/, "", tmp)
+              tmp_up = toupper(tmp)
+              if (tmp_up in confirmed) {
+                if (has_as)
+                  out = out ") AS " tmp "_ ON"
+                else
+                  out = out ") " tmp "_ ON"
+                i += RLENGTH
+                continue
+              }
+            }
+          }
+          # Try "KW." at position i (word-start)
+          if (c ~ /[A-Za-z_]/) {
+            j = i
+            while (j <= n && substr(rest, j, 1) ~ /[A-Za-z0-9_]/) j++
+            word = substr(rest, i, j - i)
+            word_up = toupper(word)
+            after = substr(rest, j, 1)
+            if (after == "." && word_up in confirmed) {
+              out = out word "_."
+              i = j + 1
+              continue
+            }
+          }
           out = out c
           if (c == q) {
             nx = substr(rest, i+1, 1)
