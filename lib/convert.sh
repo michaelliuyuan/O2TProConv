@@ -675,7 +675,7 @@ convert_one() {
   local text; text="$(cat "$in")"
   text="$(sed -E '1s/^\xEF\xBB\xBF//' <<<"$text")"
   text="$(_tochar_date       <<<"$text")"
-  text="$(_strip_gbk_comments <<<"$text")"
+  #text="$(_strip_gbk_comments <<<"$text")"  # TEMP: disabled for UTF-8 source
   text="$(_resolve_anchor_type <<<"$text")"
   text="$(_resolve_rowtype   <<<"$text")"
   text="$(_apply_mechanical  <<<"$text")"
