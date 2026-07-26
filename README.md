@@ -423,7 +423,8 @@ DELIMITER ;
 - [x] **PKG_CB_LIST_CB 生产级验证**：真实生产 PACKAGE 113 TODO → **0**（100% 自动转换）
 - [x] **P4-a：`%ROWTYPE` 自动展开** — `_resolve_rowtype` pass（pipeline 紧跟 `_resolve_anchor_type`）：`v_name table%ROWTYPE` → 逐字段 DECLARE（查 `_schema_columns.tsv`）；代码层 `v_name.col` → `v_name_col`（引号感知替换）；动态 SQL 字符串内 → 标 TODO 不替换；变量名 guard（≥3 字符 + 非保留词）；离线 fallback（`e278356` / `00d7371`）
 - [x] **P5-b：多变量 `EXECUTE IMMEDIATE INTO` 自动转换** — 复用 `@o2t_into_` 中转模式，`EXECUTE stmt INTO @o2t_a, @o2t_b` + `SET a=@o2t_a; SET b=@o2t_b`；USING 子句保留（`8de90df`）
-- [ ] deferred：T3 族（BULK COLLECT·集合·内联游标 FOR 自动转换）、GOTO→unsupported TODO、动态 SQL 字符串值内残留深度解析（P3-a 储备）、SELECT * INTO %ROWTYPE 展开（P4-a-2）
+- [x] **端到端 TiDB 部署验证** — PKG_CB_LIST_CB 在 TiDB v7.1.9 上 CREATE + CALL + 动态 SQL EXECUTE 成功（Phase 1 核心验证达成）；12 个生产部署 bug 修复（GBK/引号/注释/NULL 传播/保留字）
+- [ ] deferred：T3 族（BULK COLLECT·集合·内联游标 FOR 自动转换）、GOTO→unsupported TODO、动态 SQL `||` 变量 IFNULL 包裹（P5-c）、SELECT * INTO %ROWTYPE 展开（P4-a-2）、MySQL 保留字别名自动检测（P5-d）
 
 ## 常见问题（FAQ）
 
