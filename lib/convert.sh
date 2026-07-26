@@ -952,12 +952,19 @@ _rename_reserved_kw() {
         "WINDOW WITH WRITE XOR YEAR_MONTH ZEROFILL", kw_arr, " ")
       for (i = 1; i <= n; i++) is_reserved[kw_arr[i]] = 1
     }
-    # Pass 1: collect confirmed aliases from ") [AS] KW ON" patterns
+    # Pass 1: collect confirmed aliases from "KW ON" patterns
+    # Matches: ) KW ON, table KW ON, ) AS KW ON, table AS KW ON
+    # KW must be a MySQL reserved word. The preceding token ( ) or identifier)
+    # disambiguates from column ON (e.g. "TURN ON" is not a JOIN alias).
     NR == FNR {
       line = $0
-      while (match(line, /\)[ \t]+(AS[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]+ON\b/)) {
+      # Pattern: [) or identifier] [AS] KW ON
+      # Use [A-Za-z0-9_).] to allow: closing paren, table name, schema.table
+      while (match(line, /[A-Za-z0-9_).][ \t]+(AS[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]+ON\b/)) {
         seg = substr(line, RSTART, RLENGTH)
-        sub(/^\)[ \t]+/, "", seg)
+        # Extract the KW between the preceding token and ON
+        # Strip leading token + whitespace
+        sub(/^[A-Za-z0-9_).]+[ \t]+/, "", seg)
         sub(/^[Aa][Ss][ \t]+/, "", seg)
         sub(/[ \t]+ON$/, "", seg)
         seg_up = toupper(seg)
@@ -981,22 +988,27 @@ _rename_reserved_kw() {
           # In string literal: still check for confirmed alias patterns
           # This handles dynamic SQL string values containing JOIN aliases
           # e.g. ... LEFT JOIN (...) MOD ON MOD.X ... inside V_SQL
-          # Try ") [AS] KW ON" at position i
-          if (c == ")") {
-            m = match(substr(rest, i), /^\)[ \t]+(AS[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]+ON\b/)
+          # or   ... JOIN TABLE_NAME MOD ON MOD.X ... inside V_SQL
+          # Try "KW ON" where KW is confirmed — look for preceding ) or identifier
+          if (c ~ /[A-Za-z_)/) {
+            # Check if this position starts a confirmed "preceding [AS] KW ON"
+            m = match(substr(rest, i), /^[A-Za-z0-9_).][ \t]+(AS[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]+ON\b/)
             if (m > 0) {
               seg = substr(rest, i, RLENGTH)
               tmp = seg
-              has_as = (tmp ~ /\)[ \t]+AS[ \t]+/i)
-              sub(/^\)[ \t]+/, "", tmp)
+              has_as = (tmp ~ /[ \t]+AS[ \t]+/i)
+              # Strip leading token + whitespace
+              sub(/^[A-Za-z0-9_).]+[ \t]+/, "", tmp)
               sub(/^[Aa][Ss][ \t]+/, "", tmp)
               sub(/[ \t]+ON$/, "", tmp)
               tmp_up = toupper(tmp)
               if (tmp_up in confirmed) {
+                # Preserve leading token, rename KW to KW_
+                lead = seg; sub(/[ \t]+(AS[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]+ON\b.*$/, "", lead)
                 if (has_as)
-                  out = out ") AS " tmp "_ ON"
+                  out = out lead " AS " tmp "_ ON"
                 else
-                  out = out ") " tmp "_ ON"
+                  out = out lead " " tmp "_ ON"
                 i += RLENGTH
                 continue
               }
@@ -1030,22 +1042,23 @@ _rename_reserved_kw() {
           i++
           continue
         }
-        # Try to match ") [AS] KW ON" at position i
-        if (c == ")") {
-          m = match(substr(rest, i), /^\)[ \t]+(AS[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]+ON\b/)
+        # Try to match "preceding [AS] KW ON" at position i (code layer)
+        if (c ~ /[A-Za-z_)/]) {
+          m = match(substr(rest, i), /^[A-Za-z0-9_).][ \t]+(AS[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]+ON\b/)
           if (m > 0) {
             seg = substr(rest, i, RLENGTH)
             tmp = seg
-            has_as = (tmp ~ /\)[ \t]+AS[ \t]+/i)
-            sub(/^\)[ \t]+/, "", tmp)
+            has_as = (tmp ~ /[ \t]+AS[ \t]+/i)
+            sub(/^[A-Za-z0-9_).]+[ \t]+/, "", tmp)
             sub(/^[Aa][Ss][ \t]+/, "", tmp)
             sub(/[ \t]+ON$/, "", tmp)
             tmp_up = toupper(tmp)
             if (tmp_up in confirmed) {
+              lead = seg; sub(/[ \t]+(AS[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]+ON\b.*$/, "", lead)
               if (has_as)
-                out = out ") AS " tmp "_ ON"
+                out = out lead " AS " tmp "_ ON"
               else
-                out = out ") " tmp "_ ON"
+                out = out lead " " tmp "_ ON"
               i += RLENGTH
               continue
             }
