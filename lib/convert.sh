@@ -675,7 +675,7 @@ convert_one() {
   local text; text="$(cat "$in")"
   text="$(sed -E '1s/^\xEF\xBB\xBF//' <<<"$text")"
   text="$(_tochar_date       <<<"$text")"
-  #text="$(_strip_gbk_comments <<<"$text")"  # TEMP: disabled for UTF-8 source
+  text="$(_strip_gbk_comments <<<"$text")"
   text="$(_resolve_anchor_type <<<"$text")"
   text="$(_resolve_rowtype   <<<"$text")"
   text="$(_apply_mechanical  <<<"$text")"
@@ -871,8 +871,8 @@ _apply_mechanical() {
 # 未知结构失败→留 TODO 走 fail 清单）。
 #   DECODE(expr,s1,r1,...,[default]) → CASE WHEN expr<=>s1 THEN r1 ... [ELSE default] END
 #     （MySQL null-safe <=> 等价于 DECODE 的 NULL=NULL；TiDB 支持 <=>，比手搓 IS NULL 干净）。
-#   a || b || c → NULLIF(CONCAT(IFNULL(a,''),IFNULL(b,''),IFNULL(c,'')),'')
-#     （Oracle || 对 NULL 不敏感；CONCAT 任一 NULL 则 NULL，故内层 IFNULL；外层 NULLIF 补 Oracle"空串即 NULL"）。
+#   a || b || c → COALESCE(CONCAT(IFNULL(a,''),IFNULL(b,''),IFNULL(c,'')),'')
+#     （Oracle || 对 NULL 不敏感；MySQL CONCAT 传播 NULL，故内层 IFNULL；外层 COALESCE 确保 NULL→空串，防止 || 拼接传播 NULL）。
 # char 级扫描跟踪字符串字面量（'' 转义）+ () 深度，只动 CODE 不动数据；转换不了的（跨行 /
 # 操作数边界不可靠 / 混运算符）原样保留并注入 TODO，绝不静默。
 _convert_known_semantics() {
@@ -1082,7 +1082,7 @@ _convert_known_semantics() {
         if(unsafe){ pipe_info=pipe_info "|| 操作数边界不可靠保留字面，依赖 PIPES_AS_CONCAT; "; out=out _concat_prefix _concat_chain; line=_concat_suffix; continue }
         inner=""
         for(i=1;i<=n;i++){ inner=(i==1?"":inner ", ") "IFNULL(" trim(A[i]) "," q q ")" }
-        cs="NULLIF(CONCAT(" inner ")," q q ")"
+        cs="COALESCE(CONCAT(" inner ")," q q ")"
         out=out _concat_prefix cs
         line=_concat_suffix
       }
