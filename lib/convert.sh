@@ -1441,9 +1441,11 @@ _convert_type_aware() {
         if (n==1) { if (infer_type(A[1])=="number") rep="CAST(" A[1] " AS CHAR)"; else { note=note "TO_CHAR(" A[1] ") 非 number 单参需人工; "; rep="NULL" } }
         else if (n==2 && substr(A[2],1,1)==q) {
           # TO_CHAR(date_expr, 'mask') → DATE_FORMAT(date_expr, '%mask')（掩码含日期 token 时转）
+          dq = (substr(A[2],1,2) == q q)
           m=A[2]; gsub(q,"",m)
           mm=mapmask(m)
-          if(mm!=m) rep="DATE_FORMAT(" A[1] ", " q mm q ")"
+          qq = dq ? (q q) : q
+          if(mm!=m) rep="DATE_FORMAT(" A[1] ", " qq mm qq ")"
           else { note=note "TO_CHAR(..,..) 多参(number+fmt 或残留 date)需人工; "; rep="NULL" }
         }
         else        { note=note "TO_CHAR(..,..) 多参(number+fmt 或残留 date)需人工; "; rep="NULL" }
