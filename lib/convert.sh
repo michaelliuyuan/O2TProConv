@@ -895,6 +895,8 @@ _apply_mechanical() {
     -e 's/\bCHR[ \t]*\(/CHAR(/gI' \
     -e 's/\bSYS_GUID[ \t]*\(\)/UUID()/gI' \
     -e 's/\bELSIF\b/ELSEIF/gI' \
+    -e 's/[[:space:]]MOD[[:space:]]ON/ MOD_ ON/gI' \
+    -e 's/\bMOD\./MOD_./g' \
     -e 's/^\/$//'                       # 去掉 Oracle 的 `/` 执行终止行
   # 说明：|| 与 DECODE 现由 _convert_known_semantics 做「忠实版自动转换」（已知语义差，默认开启）；
   #   转不了的（跨行/操作数边界不可靠）才注入 TODO。DATE(类型)/%TYPE/FOR..IN/
