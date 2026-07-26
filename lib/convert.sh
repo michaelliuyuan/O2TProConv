@@ -710,6 +710,7 @@ convert_one() {
   text="$(sed -E '1s/^\xEF\xBB\xBF//' <<<"$text")"
   text="$(_tochar_date       <<<"$text")"
   text="$(_strip_gbk_comments <<<"$text")"
+  text="$(_strip_dynsql_inline_comments <<<"$text")"
   text="$(_resolve_anchor_type <<<"$text")"
   text="$(_resolve_rowtype   <<<"$text")"
   text="$(_apply_mechanical  <<<"$text")"
@@ -722,7 +723,6 @@ convert_one() {
   text="$(_restructure    <<<"$text")"
   text="$(_convert_type_aware <<<"$text")"
   text="$(_cleanup_ref_cursor <<<"$text")"
-  text="$(_strip_dynsql_inline_comments <<<"$text")"
   {
     echo "-- 由 oracle2tidb-sp 自动转换生成；请核对带 -- TODO(需人工转换) 的行"
     # P2-b: 若输出含残留 ||（SQL 字符串值内或跨行未转），注入幂等 SET SESSION sql_mode
