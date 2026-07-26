@@ -905,24 +905,135 @@ _apply_mechanical() {
   #   EXECUTE IMMEDIATE 现由 _restructure 半自动转 PREPARE/EXECUTE/DEALLOCATE。
 }
 
-# P5-d: MySQL/TiDB 保留关键字作为表/列别名时自动改名（加 _ 后缀）。
-# 只匹配两种上下文：
-#   1) `) KW ON` — JOIN 子查询的表别名 + ON 关键字
-#   2) `KW.` — 别名列引用（点号前缀）
-# 不误匹配函数调用 KW( 或更长的标识符 KWXYZ。
-# 保留字列表来自 MySQL 8.0 reserved words 中常见的 SP 别名。
+# P5-d: MySQL/TiDB 保留关键字作为 JOIN 别名时自动改名（加 _ 后缀）。
+# 两阶段：
+#   1) 扫描 `) KW ON` 模式，提取确认为别名的 KW（需在 MySQL 保留字列表内）
+#   2) 仅对确认的别名做 `) KW ON` → `) KW_ ON` 和 `KW.` → `KW_.` 替换
+# 不做全局 KW. 替换——避免误改合法的 schema.table.column 引用。
+# 不改字符串字面量内的内容（引号感知）。
 _rename_reserved_kw() {
-  local reserved="MOD CHECK CONDITION STATUS GROUP ORDER RANK LEVEL KEY READ \
-SIGNAL RESIGNAL MATCH REPEAT PARTITION WITHOUT WITHIN \
-OPTION ROLE ADMIN SYSTEM DATABASE USER SCHEMA TABLE COLUMN \
-INDEX VIEW TRIGGER EVENT NAME TYPE SIZE YEAR MONTH DAY \
-HOUR MINUTE SECOND LANGUAGE NUMBER PROCEDURE FUNCTION"
-  local kw sed_args=()
-  for kw in $reserved; do
-    sed_args+=(-e "s/\)[[:space:]]+${kw}[[:space:]]+ON\b/) ${kw}_ ON/gI")
-    sed_args+=(-e "s/\b${kw}\./${kw}_./gI")
-  done
-  sed -E "${sed_args[@]}"
+  local tmp; tmp=$(mktemp)
+  cat > "$tmp"
+  gawk '
+    BEGIN {
+      q = sprintf("%c", 39)
+      # MySQL 8.0 reserved words (R) that could appear as SP table aliases
+      n = split("ACCESSIBLE ADD ALL ALTER ANALYZE AND AS ASC ASENSITIVE BEFORE " \
+        "BETWEEN BIGINT BINARY BLOB BOTH BY CALL CASCADE CASCADED CASE CAST " \
+        "CHAR CHARACTER CHECK COLLATE COLUMN CONDITION CONSTRAINT CONTINUE " \
+        "CONVERT CREATE CROSS CUBE CUME_DIST CURRENT_DATE CURRENT_TIME " \
+        "CURRENT_TIMESTAMP CURRENT_USER CURSOR DATABASE DATABASES DAY_HOUR " \
+        "DAY_MICROSECOND DAY_MINUTE DAY_SECOND DEC DECIMAL DECLARE DEFAULT " \
+        "DELAYED DELETE DENSE_RANK DESC DESCRIBE DETERMINISTIC DISTINCT " \
+        "DISTINCTROW DIV DOUBLE DROP DUAL EACH ELSE ELSEIF EMPTY ENCLOSED " \
+        "ESCAPED EXCEPT EXISTS EXIT EXPLAIN FALSE FETCH FIRST_VALUE FLOAT " \
+        "FLOAT4 FLOAT8 FOR FORCE FOREIGN FROM FULLTEXT FUNCTION GENERATED " \
+        "GET GRANT GROUP GROUPING GROUPS HAVING HIGH_PRIORITY HOUR_MICROSECOND " \
+        "HOUR_MINUTE HOUR_SECOND IF IGNORE IN INDEX INFILE INNER INOUT " \
+        "INSENSITIVE INSERT INT INTEGER INTERVAL INTO IO_AFTER_GTIDS " \
+        "IO_BEFORE_GTIDS IS ITERATE JOIN JSON_TABLE KEY KEYS KILL LAG " \
+        "LAST_VALUE LATERAL LEAD LEADING LEAVE LEFT LIKE LIMIT LINEAR " \
+        "LINES LOAD LOCALTIME LOCALTIMENT LOCK LONG LONGBLOB LONGTEXT LOOP " \
+        "LOW_PRIORITY MASTER_BIND MASTER_SSL_VERIFY_SERVER_CERT MATCH " \
+        "MAXVALUE MEDIUMBLOB MEDIUMINT MEDIUMTEXT MIDDLEINT MINUTE_MICROSECOND " \
+        "MINUTE_SECOND MOD MODIFIES NATURAL NOT NO_WRITE_TO_BINLOG NTH_VALUE " \
+        "NTILE NULL NUMERIC OF ON OPTIMIZE OPTIMIZER_COSTS OPTION OPTIONALLY " \
+        "OR ORDER OUT OUTER OVER PARTITION PERCENT_RANK PRECISION PRIMARY " \
+        "PROCEDURE RANGE READ READS READ_WRITE REAL RECURSIVE REFERENCES " \
+        "REGEXP RELEASE RENAME REPEAT REPLACE REQUIRE RESIGNAL RESTRICT " \
+        "RETURN REVOKE RIGHT RLIKE ROW ROWS ROW_NUMBER SCHEMA SCHEMAS " \
+        "SECOND_MICROSECOND SELECT SENSITIVE SEPARATOR SET SHOW SIGNAL " \
+        "SMALLINT SPATIAL SPECIFIC SQL SQLEXCEPTION SQLSTATE SQLWARNING " \
+        "SQL_BIG_RESULT SQL_CALC_FOUND_ROWS SQL_SMALL_RESULT SSL STARTING " \
+        "STORED STRAIGHT_JOIN SYSTEM TABLE TABLES TERMINATED THEN TINYBLOB " \
+        "TINYINT TINYTEXT TO TRIGGER TRUE UNDO UNION UNIQUE UNLOCK UNSIGNED " \
+        "UPDATE USAGE USE USING UTC_DATE UTC_TIME UTC_TIMESTAMP VALUES " \
+        "VARBINARY VARCHAR VARCHARACTER VARYING VIRTUAL WHEN WHERE WHILE " \
+        "WINDOW WITH WRITE XOR YEAR_MONTH ZEROFILL", kw_arr, " ")
+      for (i = 1; i <= n; i++) is_reserved[kw_arr[i]] = 1
+    }
+    # Pass 1: collect confirmed aliases from ") [AS] KW ON" patterns
+    NR == FNR {
+      line = $0
+      while (match(line, /\)[ \t]+(AS[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]+ON\b/)) {
+        seg = substr(line, RSTART, RLENGTH)
+        sub(/^\)[ \t]+/, "", seg)
+        sub(/^[Aa][Ss][ \t]+/, "", seg)
+        sub(/[ \t]+ON$/, "", seg)
+        seg_up = toupper(seg)
+        if (seg_up in is_reserved) {
+          confirmed[seg_up] = seg
+        }
+        line = substr(line, RSTART + RLENGTH)
+      }
+      next
+    }
+    # Pass 2: rename only confirmed aliases (string-aware — skip string literals)
+    {
+      out = ""
+      rest = $0
+      in_str = 0
+      n = length(rest)
+      i = 1
+      while (i <= n) {
+        c = substr(rest, i, 1)
+        if (in_str) {
+          out = out c
+          if (c == q) {
+            nx = substr(rest, i+1, 1)
+            if (nx == q) { out = out nx; i += 2; continue }
+            in_str = 0
+          }
+          i++
+          continue
+        }
+        if (c == q) {
+          out = out c
+          in_str = 1
+          i++
+          continue
+        }
+        # Try to match ") [AS] KW ON" at position i
+        if (c == ")") {
+          m = match(substr(rest, i), /^\)[ \t]+(AS[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]+ON\b/)
+          if (m > 0) {
+            seg = substr(rest, i, RLENGTH)
+            tmp = seg
+            has_as = (tmp ~ /\)[ \t]+AS[ \t]+/i)
+            sub(/^\)[ \t]+/, "", tmp)
+            sub(/^[Aa][Ss][ \t]+/, "", tmp)
+            sub(/[ \t]+ON$/, "", tmp)
+            tmp_up = toupper(tmp)
+            if (tmp_up in confirmed) {
+              if (has_as)
+                out = out ") AS " tmp "_ ON"
+              else
+                out = out ") " tmp "_ ON"
+              i += RLENGTH
+              continue
+            }
+          }
+        }
+        # Try to match "KW." at position i (word-start)
+        if (c ~ /[A-Za-z_]/) {
+          j = i
+          while (j <= n && substr(rest, j, 1) ~ /[A-Za-z0-9_]/) j++
+          word = substr(rest, i, j - i)
+          word_up = toupper(word)
+          after = substr(rest, j, 1)
+          if (after == "." && word_up in confirmed) {
+            out = out word "_."
+            i = j + 1
+            continue
+          }
+        }
+        out = out c
+        i++
+      }
+      print out
+    }
+  ' "$tmp" "$tmp"
+  rm -f "$tmp"
 }
 
 # 已知 Oracle↔MySQL 语义差的忠实版自动转换（架构师决策：已知语义差→忠实修、默认开启；
