@@ -748,6 +748,14 @@ convert_one() {
   text="$(_restructure    <<<"$text")"
   text="$(_convert_type_aware <<<"$text")"
   text="$(_cleanup_ref_cursor <<<"$text")"
+  # Node.js post-processor: convert remaining cross-line DECODE to CASE WHEN
+  # Handles '' quote escaping correctly, cross-platform (no gawk dependency)
+  if command -v node >/dev/null 2>&1 && [[ -f "$ROOT_DIR/postproc_decode.js" ]]; then
+    local _pp_tmp; _pp_tmp="$(mktemp)"
+    printf '%s' "$text" > "$_pp_tmp"
+    text="$(node "$ROOT_DIR/postproc_decode.js" "$_pp_tmp" 2>/dev/null || printf '%s' "$text")"
+    rm -f "$_pp_tmp"
+  fi
   {
     echo "-- 由 oracle2tidb-sp 自动转换生成；请核对带 -- TODO(需人工转换) 的行"
     # P2-b: 若输出含残留 ||（SQL 字符串值内或跨行未转），注入幂等 SET SESSION sql_mode
@@ -1613,27 +1621,9 @@ _convert_known_semantics() {
       if(line ~ /^[ \t]*--/){ print line; next }
       todo=""
       pipe_info=""
-      # P2-c: 跨行 DECODE 归一化——检测未闭合的 DECODE(，缓冲后续行直到括号闭合
-      if(has_unclosed_decode(line) || _has_unclosed_decode_in_str(line)){
-        _dj=line; _dn=1
-        while(_dn < 50 && has_unclosed_decode(_dj)){
-          if((getline _dnx) <= 0) break
-          _dn++
-          if(_dnx ~ /^[ \t]*--/){ print _dnx; continue }
-          _dj=_dj " " _dnx
-        }
-        # Also try string-internal DECODE with its own buffer (separate from code-level)
-        if(_has_unclosed_decode_in_str(_dj)){
-          _dn2=0
-          while(_dn2 < 50 && _has_unclosed_decode_in_str(_dj)){
-            if((getline _dnx) <= 0) break
-            _dn2++
-            if(_dnx ~ /^[ \t]*--/){ print _dnx; continue }
-            _dj=_dj " " _dnx
-          }
-        }
-        line=_dj
-      }
+      # P2-c: DECODE multi-line buffer DISABLED — was causing over-merge (5529 char lines)
+      # Cross-line DECODE conversion now handled by Node.js post-processor (postproc_decode.js)
+      # which correctly handles '' quote escaping without gawk implementation differences
       # P5-c: 跨行 || 链归一化——检测未闭合的字符串字面量（|| 后字符串跨行），缓冲直到闭合
       if(has_unclosed_concat(line)){
         _cj=line; _cn=1
