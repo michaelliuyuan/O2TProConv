@@ -739,6 +739,14 @@ convert_one() {
   text="$(_resolve_rowtype   <<<"$text")"
   text="$(_apply_mechanical  <<<"$text")"
   text="$(_rename_reserved_kw <<<"$text")"
+  # Node.js pre-processor: convert cross-line DECODE to CASE WHEN BEFORE concat buffer merges them
+  # Handles '' quote escaping correctly, cross-platform (no gawk dependency)
+  if command -v node >/dev/null 2>&1 && [[ -f "$ROOT_DIR/postproc_decode.js" ]]; then
+    local _pp_tmp; _pp_tmp="$(mktemp)"
+    printf '%s' "$text" > "$_pp_tmp"
+    text="$(node "$ROOT_DIR/postproc_decode.js" "$_pp_tmp" 2>/dev/null || printf '%s' "$text")"
+    rm -f "$_pp_tmp"
+  fi
   text="$(_convert_known_semantics <<<"$text")"
   text="$(_fix_header     <<<"$text")"
   text="$(_mark_complex   <<<"$text")"
@@ -748,14 +756,6 @@ convert_one() {
   text="$(_restructure    <<<"$text")"
   text="$(_convert_type_aware <<<"$text")"
   text="$(_cleanup_ref_cursor <<<"$text")"
-  # Node.js post-processor: convert remaining cross-line DECODE to CASE WHEN
-  # Handles '' quote escaping correctly, cross-platform (no gawk dependency)
-  if command -v node >/dev/null 2>&1 && [[ -f "$ROOT_DIR/postproc_decode.js" ]]; then
-    local _pp_tmp; _pp_tmp="$(mktemp)"
-    printf '%s' "$text" > "$_pp_tmp"
-    text="$(node "$ROOT_DIR/postproc_decode.js" "$_pp_tmp" 2>/dev/null || printf '%s' "$text")"
-    rm -f "$_pp_tmp"
-  fi
   {
     echo "-- 由 oracle2tidb-sp 自动转换生成；请核对带 -- TODO(需人工转换) 的行"
     # P2-b: 若输出含残留 ||（SQL 字符串值内或跨行未转），注入幂等 SET SESSION sql_mode
