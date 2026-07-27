@@ -912,6 +912,7 @@ _apply_mechanical() {
   # GB18030→UTF-8 preprocessing ensures clean text; these rules were deleting legitimate Chinese chars
   sed -E '/^[[:space:]]*\/\*[[:space:]]*$/d; /^[[:space:]]*\*\/[[:space:]]*$/d' | \
   sed -E \
+    -e 's/(^|[[:space:]])--([^ \t!-])/\1-- \2/g' \
     -e '/^[[:space:]]*--/b' \
     -e 's/([[:space:]]--[^'"'"']*);[[:space:]]*$/\1/' \
     -e 's/([[:space:]])--([^ \t!-])/\1-- \2/g' \
