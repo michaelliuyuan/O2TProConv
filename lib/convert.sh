@@ -693,7 +693,15 @@ _strip_gbk_comments() {
     printf '%s' "$text"
     return 0
   fi
-  # GBK or corrupted encoding — strip non-ASCII bytes as ? to preserve quote pairing
+  # GBK encoded input — convert to UTF-8 first so downstream passes
+  # (_strip_dynsql_inline_comments, _restructure) get proper quote/context tracking
+  local converted
+  converted="$(printf '%s' "$text" | iconv -f GBK -t UTF-8 //IGNORE 2>/dev/null)"
+  if [[ $? -eq 0 ]] && [[ -n "$converted" ]]; then
+    printf '%s' "$converted"
+    return 0
+  fi
+  # Fallback: iconv failed — strip non-ASCII bytes as ? to preserve quote pairing
   printf '%s' "$text" | sed -E \
     -e 's/[^[:print:][:space:]]/?/g' \
     -e 's/[[:space:]]*-*--[[:space:]]*$//' \
