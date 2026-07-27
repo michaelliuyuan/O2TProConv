@@ -82,6 +82,9 @@ for (const line of lines) {
   else { pending = line; pendingLines = 1; }
   // Flush if no unclosed DECODE, or if we've buffered too many lines (safety)
   if (!hasUnclosedDecode(pending) || pendingLines > 10) {
+    if (pendingLines > 1 && pending.includes('DECODE')) {
+      process.stderr.write('[DEBUG] Flushing ' + pendingLines + ' lines, DECODE content: ' + pending.substring(0, 100) + '\n');
+    }
     output += convDecode(pending) + '\n';
     pending = '';
     pendingLines = 0;
