@@ -60,14 +60,24 @@ run_convert() {
   local f base out todos status total=0 need_review=0 failed=0
   local note_section="" sem_section="" todo_section="" pipes_section="" tmpdir
   tmpdir="$(mktemp -d)"
-  for f in "$ORACLE_DIR"/*.sql; do
+  for f in "$ORACLE_DIR"/*.sql "$ORACLE_DIR"/*.pck; do
+    [[ -f "$f" ]] || continue
     [[ "$(basename "$f")" == _* ]] && continue      # 跳过 _proc_list.tsv 等辅助文件
-    base="$(basename "$f" .sql)"
+    base="$(basename "$f")
+    base="${base%.sql}"
+    base="${base%.pck}"
 
-    # 文件级预处理：BOM strip + CRLF strip + GB18030→UTF-8 编码转换
+    # 文件级预处理：BOM strip + 编码转换 + CRLF strip
     # 必须在所有 awk/sed pass 之前（含 _split_package_body），确保下游拿到干净 UTF-8 LF 文本
+    # 扩展名约定：.pck → GB18030→UTF-8（Oracle 导出标准编码）；.sql → pass-through（已是 UTF-8）
     local f_clean="$tmpdir/${base}.clean.sql"
-    { sed -E '1s/^\xEF\xBB\xBF//' "$f" | tr -d '\r' | iconv -f GB18030 -t UTF-8//IGNORE 2>/dev/null || sed -E '1s/^\xEF\xBB\xBF//' "$f" | tr -d '\r'; } > "$f_clean"
+    local f_ext="${f##*.}"
+    if [[ "$f_ext" == "pck" ]] && command -v iconv >/dev/null 2>&1; then
+      sed -E '1s/^\xEF\xBB\xBF//' "$f" | iconv -f GB18030 -t UTF-8//IGNORE | tr -d '\r' > "$f_clean"
+      [[ -s "$f_clean" ]] || sed -E '1s/^\xEF\xBB\xBF//' "$f" | tr -d '\r' > "$f_clean"
+    else
+      sed -E '1s/^\xEF\xBB\xBF//' "$f" | tr -d '\r' > "$f_clean"
+    fi
     f="$f_clean"
 
     # PACKAGE BODY 拆分：一个 PACKAGE_BODY 含多个 PROCEDURE/FUNCTION → 拆为独立文件分别转换
