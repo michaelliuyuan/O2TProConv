@@ -739,8 +739,7 @@ convert_one() {
   text="$(_resolve_rowtype   <<<"$text")"
   text="$(_apply_mechanical  <<<"$text")"
   text="$(_rename_reserved_kw <<<"$text")"
-  # Node.js pre-processor: convert cross-line DECODE to CASE WHEN BEFORE concat buffer merges them
-  # Handles '' quote escaping correctly, cross-platform (no gawk dependency)
+  # Node.js pre-processor: convert cross-line DECODE to CASE WHEN before concat buffer
   if command -v node >/dev/null 2>&1 && [[ -f "$ROOT_DIR/postproc_decode.js" ]]; then
     local _pp_tmp; _pp_tmp="$(mktemp)"
     printf '%s' "$text" > "$_pp_tmp"
@@ -911,6 +910,7 @@ _apply_mechanical() {
   # Removed: /[^[:print:][:space:]]/d rules — Windows gawk treats UTF-8 Chinese as non-printable
   # GB18030→UTF-8 preprocessing ensures clean text; these rules were deleting legitimate Chinese chars
   sed -E '/^[[:space:]]*\/\*[[:space:]]*$/d; /^[[:space:]]*\*\/[[:space:]]*$/d' | \
+  sed -E 's~/\*\+[^*]*\*/~~g' | \
   sed -E \
     -e 's/(^|[[:space:]])--([^ \t!-])/\1-- \2/g' \
     -e '/^[[:space:]]*--/b' \
