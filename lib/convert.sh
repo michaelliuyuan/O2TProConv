@@ -1625,6 +1625,7 @@ _convert_known_semantics() {
       # Cross-line DECODE conversion now handled by Node.js post-processor (postproc_decode.js)
       # which correctly handles '' quote escaping without gawk implementation differences
       # P5-c: 跨行 || 链归一化——检测未闭合的字符串字面量（|| 后字符串跨行），缓冲直到闭合
+      # LIMIT: stop merging after 20 lines or when buffer has balanced quotes (no active || chain)
       if(has_unclosed_concat(line)){
         _cj=line; _cn=1
         while(_cn < 20 && has_unclosed_concat(_cj)){
@@ -1632,6 +1633,8 @@ _convert_known_semantics() {
           _cn++
           if(_cnx ~ /^[ \t]*--/){ print _cnx; continue }
           _cj=_cj " " _cnx
+          # Safety: if buffer is getting very long (5000+ chars), stop to avoid over-merge
+          if(length(_cj) > 5000) break
         }
         line=_cj
       }
@@ -1944,33 +1947,10 @@ _convert_type_aware() {
       lines[NR]=$0
     }
     END {   # pass 2：类型感知转换 + NOTE
-      # Fold multi-line content inside string literals where bracket depth > 0
-      # This enables conv_decode to match parens across lines in V_SQL dynamic SQL
-      folded_text = ""; fold_in_str = 0; fold_depth = 0
-      for (fi=1; fi<=NR; fi++) {
-        fl = lines[fi]
-        if (fi > 1) {
-          if (fold_in_str && fold_depth > 0) folded_text = folded_text " "
-          else folded_text = folded_text "\n"
-        }
-        folded_text = folded_text fl
-        # Scan this line to update fold state for next line boundary
-        fln = length(fl)
-        for (fj=1; fj<=fln; fj++) {
-          fc = substr(fl, fj, 1)
-          fx = substr(fl, fj+1, 1)
-          if (fold_in_str) {
-            if (fc == q) { if (fx == q) { fj++; continue } else { fold_in_str = 0 } continue }
-            if (fc == "(") fold_depth++
-            else if (fc == ")") { if(fold_depth>0) fold_depth-- }
-            continue
-          }
-          if (fc == q) { fold_in_str = 1; fold_depth = 0; continue }
-        }
-      }
-      delete lines
-      nlines = split(folded_text, lines, "\n")
-      for (i=1; i<=nlines; i++) {
+      # NOTE: multi-line fold DISABLED in _convert_type_aware — it over-merged
+      # V_SQL string lines (fold_in_str && depth>0 matched entire SELECT body).
+      # Cross-line DECODE handled by Node.js post-processor instead.
+      for (i=1; i<=NR; i++) {
         l=lines[i]; note=""
         if (l ~ /^[ \t]*--/) { print l; continue }
         l=conv_trunc(l); l=conv_instr(l); l=conv_decode(l); l=conv_to_number(l); l=conv_to_char_num(l); l=conv_substr(l); l=conv_nextval(l)
