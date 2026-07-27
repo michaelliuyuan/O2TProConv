@@ -70,18 +70,21 @@ function hasUnclosedDecode(line) {
 }
 
 let pending = '';
+let pendingLines = 0;
 let output = '';
 for (const line of lines) {
   if (line.match(/^[ \t]*--/)) {
-    if (pending) { output += convDecode(pending) + '\n'; pending = ''; }
+    if (pending) { output += convDecode(pending) + '\n'; pending = ''; pendingLines = 0; }
     output += line + '\n';
     continue;
   }
-  if (pending) pending += ' ' + line;
-  else pending = line;
-  if (!hasUnclosedDecode(pending)) {
+  if (pending) { pending += ' ' + line; pendingLines++; }
+  else { pending = line; pendingLines = 1; }
+  // Flush if no unclosed DECODE, or if we've buffered too many lines (safety)
+  if (!hasUnclosedDecode(pending) || pendingLines > 10) {
     output += convDecode(pending) + '\n';
     pending = '';
+    pendingLines = 0;
   }
 }
 if (pending) output += convDecode(pending) + '\n';
