@@ -63,7 +63,7 @@ run_convert() {
   for f in "$ORACLE_DIR"/*.sql "$ORACLE_DIR"/*.pck; do
     [[ -f "$f" ]] || continue
     [[ "$(basename "$f")" == _* ]] && continue      # 跳过 _proc_list.tsv 等辅助文件
-    base="$(basename "$f")
+    base="$(basename "$f")"
     base="${base%.sql}"
     base="${base%.pck}"
 
