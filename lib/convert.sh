@@ -708,6 +708,7 @@ convert_one() {
   local in="$1" out="$2"
   local text; text="$(cat "$in")"
   text="$(sed -E '1s/^\xEF\xBB\xBF//' <<<"$text")"
+  text="$(tr -d '\r' <<<"$text")"
   text="$(_tochar_date       <<<"$text")"
   text="$(_strip_gbk_comments <<<"$text")"
   text="$(_strip_dynsql_inline_comments <<<"$text")"
@@ -898,7 +899,58 @@ _apply_mechanical() {
     -e 's/\bELSIF\b/ELSEIF/gI' \
     -e 's/^---/-- -/' \
     -e 's/[[:space:]]---/ -- -/g' \
-    -e 's/^\/$//'                       # 去掉 Oracle 的 `/` 执行终止行
+    -e 's/^\/$//' |                      # 去掉 Oracle 的 `/` 执行终止行
+  # P6: instr 4-param inside dynamic SQL strings (escaped '' quotes) and code
+  # Convert INSTR(s,sub,1,1) → LOCATE(sub,s) globally using gawk with proper paren matching
+  gawk '
+    BEGIN { q = sprintf("%c", 39) }
+    function match_paren(s, op,   n,i,depth,c,in_str,nx){
+      n=length(s); depth=0; in_str=0
+      for(i=op;i<=n;i++){
+        c=substr(s,i,1)
+        if(in_str){ if(c==q){ nx=substr(s,i+1,1); if(nx==q){i++;continue} else in_str=0 } continue }
+        if(c==q){ in_str=1; continue }
+        if(c=="(") depth++
+        else if(c==")"){ depth--; if(depth==0) return i }
+      }
+      return 0
+    }
+    function split_topcomma(s, A,   n,i,c,depth,in_str,cur,cnt,nx){
+      n=length(s); depth=0; in_str=0; cur=""; cnt=0
+      for(i=1;i<=n;i++){
+        c=substr(s,i,1)
+        if(in_str){ cur=cur c; if(c==q){ nx=substr(s,i+1,1); if(nx==q){cur=cur nx; i++;continue} else in_str=0 } continue }
+        if(c==q){ in_str=1; cur=cur c; continue }
+        if(c=="("){ depth++; cur=cur c; continue }
+        if(c==")"){ depth--; cur=cur c; continue }
+        if(c=="," && depth==0){ cnt++; A[cnt]=cur; cur=""; continue }
+        cur=cur c
+      }
+      cnt++; A[cnt]=cur
+      for(i=1;i<=cnt;i++) { sub(/^[ \t]+/,"",A[i]); sub(/[ \t]+$/,"",A[i]) }
+      return cnt
+    }
+    {
+      line=$0; out=""
+      while(1){
+        if(!match(line, /[Ii][Nn][Ss][Tt][Rr][ \t]*\(/)) { out=out line; break }
+        pos=RSTART
+        if(pos>1 && substr(line,pos-1,1) ~ /[A-Za-z0-9_]/){ out=out substr(line,1,pos+4); line=substr(line,pos+5); continue }
+        cpos=RSTART+RLENGTH-1
+        epos=match_paren(line,cpos)
+        if(epos==0){ out=out line; break }
+        mid=substr(line,cpos+1,epos-cpos-1)
+        n=split_topcomma(mid,A)
+        if(n==4 && A[3]=="1" && A[4]=="1") rep="LOCATE(" A[2] "," A[1] ")"
+        else if(n==3) rep="LOCATE(" A[2] "," A[1] "," A[3] ")"
+        else if(n==2) rep="LOCATE(" A[2] "," A[1] ")"
+        else rep="INSTR(" mid ")"
+        out=out substr(line,1,pos-1) rep
+        line=substr(line,epos+1)
+      }
+      print out
+    }
+  '
   # 说明：|| 与 DECODE 现由 _convert_known_semantics 做「忠实版自动转换」（已知语义差，默认开启）；
   #   转不了的（跨行/操作数边界不可靠）才注入 TODO。DATE(类型)/%TYPE/FOR..IN/
   #   BULK COLLECT/EXCEPTION/CURSOR..IS/DBMS_OUTPUT 仍由 _mark_complex 标人工。
@@ -1305,8 +1357,27 @@ _convert_known_semantics() {
           if(_concat_suffix ~ /^[ \t]*$/ && _concat_chain_balanced){
             # 允许：链完整且行末终止
           } else {
-            pipe_info=pipe_info "|| 跨行续行保留字面，依赖 PIPES_AS_CONCAT; "
-            out=out _concat_prefix _concat_chain
+            # P5-c extended: 跨行续行也需 IFNULL 包裹变量操作数，防止 NULL 传播
+            # 保留 || 结构（依赖 PIPES_AS_CONCAT），但变量操作数包 IFNULL
+            n=split_pipes(_concat_chain,A)
+            chain_rebuilt=""
+            for(i=1;i<=n;i++){
+              op=trim(A[i])
+              if(i>1) chain_rebuilt=chain_rebuilt " || "
+              # 判断是否纯字符串字面量（含 '' 转义）：以引号开头且引号成对
+              is_literal=0
+              if(length(op)>0 && substr(op,1,1)==q){
+                # strip_str 去掉字符串后看是否为空
+                if(strip_str(op) == "") is_literal=1
+              }
+              if(is_literal || op==""){
+                chain_rebuilt=chain_rebuilt op
+              } else {
+                chain_rebuilt=chain_rebuilt "IFNULL(" op "," q q ")"
+              }
+            }
+            pipe_info=pipe_info "|| 跨行续行 IFNULL 包裹变量侧，依赖 PIPES_AS_CONCAT; "
+            out=out _concat_prefix chain_rebuilt
             line=_concat_suffix
             continue
           }
@@ -1680,7 +1751,12 @@ _convert_type_aware() {
         if (n==2)      rep="LOCATE(" A[2] ", " A[1] ")"                                  # ⚠️前两参互换 INSTR(s,sub)→LOCATE(sub,s)
         else if (n==3) { if (A[3] ~ /^-/) { note=note "INSTR 负 start(反向搜索) LOCATE 不支持需人工; "; rep="NULL" }
                          else rep="LOCATE(" A[2] ", " A[1] ", " A[3] ")" }
-        else           { note=note "INSTR 4 参(nth)无直接等价需人工; "; rep="NULL" }
+        else if (n==4) {
+                         # INSTR(s,sub,start,nth): start=1,nth=1 => LOCATE(sub,s); start=1,nth=N => recursive; else NOTE
+                         if (A[3] ~ /^1$/ && A[4] ~ /^1$/) rep="LOCATE(" A[2] ", " A[1] ")"
+                         else { note=note "INSTR 4 参(start=" A[3] ",nth=" A[4] ")非1,1需人工; "; rep="LOCATE(" A[2] ", " A[1] ")" }
+                       }
+        else           { note=note "INSTR " n " 参无直接等价需人工; "; rep="NULL" }
         out=out substr(line,1,pos-1) rep; line=substr(line,epos+1)
       }
       return out line }
