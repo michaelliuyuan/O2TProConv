@@ -881,8 +881,11 @@ _apply_mechanical() {
   sed -E '/\/\*/,/\*\// { /[^[:print:][:space:]]/d; }' | \
   sed -E '/^[[:space:]]*\/\*[[:space:]]*$/d; /^[[:space:]]*\*\/[[:space:]]*$/d' | \
   sed -E \
+    -e 's/([[:space:]])--([^ \t!-])/\1-- \2/g' \
     -e '/^[[:space:]]*--.*[^[:print:][:space:]]/s/.*//' \
     -e '/^[[:space:]]*--/b' \
+    -e 's/([[:space:]]--[^'"'"']*);[[:space:]]*$/\1/' \
+    -e 's/([[:space:]])--([^ \t!-])/\1-- \2/g' \
     -e 's/[[:space:]]*-*--[[:space:]]*[^[:print:][:space:]].*$//' \
     -e 's/\bNVARCHAR2[ \t]*\(/NVARCHAR(/gI' \
     -e 's/\bNVARCHAR2\b/NVARCHAR(4000)/gI' \
