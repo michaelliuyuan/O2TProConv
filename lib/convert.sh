@@ -687,32 +687,21 @@ _strip_dynsql_inline_comments() {
 # Also clears pure-comment lines that become empty after stripping.
 _strip_gbk_comments() {
   local text; text="$(cat)"
-  # If input is valid UTF-8 (no GBK corruption), skip all stripping —
-  # Chinese chars are legitimate printable characters in UTF-8.
+  # Unconditionally convert via GB18030 — it's a superset of GBK that also
+  # passes pure ASCII through unchanged. Oracle .pck exports use GB18030.
+  # This handles all three cases: ASCII, GBK, GB18030 without needing detection.
+  local converted
+  converted="$(printf '%s' "$text" | iconv -f GB18030 -t UTF-8//IGNORE 2>/dev/null)"
+  if [[ -n "$converted" ]]; then
+    printf '%s' "$converted"
+    return 0
+  fi
+  # iconv unavailable or failed — if input is valid UTF-8, pass through unchanged
   if printf '%s' "$text" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
     printf '%s' "$text"
     return 0
   fi
-  # Non-UTF-8 input (likely GBK from Oracle .pck export) — try GBK→UTF-8 conversion
-  # Oracle .pck exports are standard GBK encoding, no need to guess
-  local converted
-  converted="$(printf '%s' "$text" | iconv -f GBK -t UTF-8//IGNORE 2>/dev/null)"
-  if [[ -n "$converted" ]]; then
-    # Verify conversion produced valid UTF-8
-    if printf '%s' "$converted" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
-      printf '%s' "$converted"
-      return 0
-    fi
-  fi
-  # Also try GB18030 (superset of GBK, covers more characters)
-  converted="$(printf '%s' "$text" | iconv -f GB18030 -t UTF-8//IGNORE 2>/dev/null)"
-  if [[ -n "$converted" ]]; then
-    if printf '%s' "$converted" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
-      printf '%s' "$converted"
-      return 0
-    fi
-  fi
-  # Fallback: all iconv attempts failed — strip non-ASCII bytes as ? to preserve quote pairing
+  # Last resort: non-UTF-8 input and iconv failed — strip non-ASCII bytes as ?
   printf '%s' "$text" | sed -E \
     -e 's/[^[:print:][:space:]]/?/g' \
     -e 's/[[:space:]]*-*--[[:space:]]*$//' \
