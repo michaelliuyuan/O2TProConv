@@ -1562,7 +1562,8 @@ _convert_known_semantics() {
           repl="GROUP_CONCAT(" expr sep_clause ")"
           # Oracle LISTAGG without separator arg = empty string concat (not comma)
           # Always add SEPARATOR '' for no-separator LISTAGG to match Oracle semantics
-          if (!has_sep) repl="GROUP_CONCAT(" expr " SEPARATOR " q q ")"
+          # In V_SQL dynamic SQL context, '' is one literal quote — need '''' for empty string
+          if (!has_sep) repl="GROUP_CONCAT(" expr " SEPARATOR " q q q q ")"
           out=out substr(line,1,pos-1) repl
           line=rest
         }
