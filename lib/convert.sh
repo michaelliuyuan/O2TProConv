@@ -752,6 +752,13 @@ convert_one() {
         [[ -z "$fn" ]] && continue
         echo "--   $fn"
       done <<<"$custom_fns"
+      # TiDB PREPARE limitation: custom functions not resolvable in dynamic SQL
+      local has_dynsql_funcs
+      has_dynsql_funcs="$(printf '%s\n' "$text" | grep -cE "(PREPARE|V_SQL|V_SQL_TEMP).*$custom_fns" 2>/dev/null || true)"
+      if [[ "${has_dynsql_funcs:-0}" -gt 0 ]]; then
+        echo "-- TODO(TiDB限制): 上述自定义函数在动态 SQL (PREPARE/EXECUTE) 内调用时"
+        echo "--   TiDB v7.1.9 无法解析 session-scoped 自定义函数，需全局注册或内联化等价逻辑"
+      fi
     fi
     # 从任意位置抽出 DROP 行、提到 DELIMITER // 之前——默认分隔符下执行、幂等：
     # 反馈环每次 pull 新 hash 重跑不会因 duplicate 挂；DROP 也不会被 // 分隔符吞掉成语法错。
