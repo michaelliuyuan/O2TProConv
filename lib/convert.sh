@@ -1614,14 +1614,23 @@ _convert_known_semantics() {
       todo=""
       pipe_info=""
       # P2-c: 跨行 DECODE 归一化——检测未闭合的 DECODE(，缓冲后续行直到括号闭合
-      # Also check for unclosed DECODE inside string literals (V_SQL dynamic SQL)
       if(has_unclosed_decode(line) || _has_unclosed_decode_in_str(line)){
         _dj=line; _dn=1
-        while(_dn < 100 && (has_unclosed_decode(_dj) || _has_unclosed_decode_in_str(_dj))){
+        while(_dn < 50 && has_unclosed_decode(_dj)){
           if((getline _dnx) <= 0) break
           _dn++
           if(_dnx ~ /^[ \t]*--/){ print _dnx; continue }
           _dj=_dj " " _dnx
+        }
+        # Also try string-internal DECODE with its own buffer (separate from code-level)
+        if(_has_unclosed_decode_in_str(_dj)){
+          _dn2=0
+          while(_dn2 < 50 && _has_unclosed_decode_in_str(_dj)){
+            if((getline _dnx) <= 0) break
+            _dn2++
+            if(_dnx ~ /^[ \t]*--/){ print _dnx; continue }
+            _dj=_dj " " _dnx
+          }
         }
         line=_dj
       }
