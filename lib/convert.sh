@@ -908,16 +908,13 @@ _emit_fn_stub() {
 
 # 机械转换：安全的、确定性的 token / 模式替换（GNU sed，支持 \b 与 I 标志）。
 _apply_mechanical() {
-  # 预处理：删除含 GBK 乱码字节的 /* */ 块注释行 + 残留的孤立 /* 或 */ 行
-  sed -E '/\/\*/,/\*\// { /[^[:print:][:space:]]/d; }' | \
+  # Removed: /[^[:print:][:space:]]/d rules — Windows gawk treats UTF-8 Chinese as non-printable
+  # GB18030→UTF-8 preprocessing ensures clean text; these rules were deleting legitimate Chinese chars
   sed -E '/^[[:space:]]*\/\*[[:space:]]*$/d; /^[[:space:]]*\*\/[[:space:]]*$/d' | \
   sed -E \
-    -e 's/([[:space:]])--([^ \t!-])/\1-- \2/g' \
-    -e '/^[[:space:]]*--.*[^[:print:][:space:]]/s/.*//' \
     -e '/^[[:space:]]*--/b' \
     -e 's/([[:space:]]--[^'"'"']*);[[:space:]]*$/\1/' \
     -e 's/([[:space:]])--([^ \t!-])/\1-- \2/g' \
-    -e 's/[[:space:]]*-*--[[:space:]]*[^[:print:][:space:]].*$//' \
     -e 's/\bNVARCHAR2[ \t]*\(/NVARCHAR(/gI' \
     -e 's/\bNVARCHAR2\b/NVARCHAR(4000)/gI' \
     -e 's/\bVARCHAR2[ \t]*\(/VARCHAR(/gI' \
