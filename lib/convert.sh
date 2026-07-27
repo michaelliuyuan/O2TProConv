@@ -1226,13 +1226,31 @@ _convert_known_semantics() {
       return cnt
     }
     # has_unclosed_decode: 检查行中是否有 DECODE( 的括号未闭合（跨行标志）
-    # 逐字符扫描，跳过字符串字面量，找到 DECODE 后的 ( 检查 match_paren 是否闭合
+    # 逐字符扫描，正确处理 '' 转义引号，找到 DECODE 后的 ( 检查 match_paren 是否闭合
+    # 注意：需检测字符串字面量内的 DECODE（动态 SQL 中的 Oracle DECODE 也需转换）
     function has_unclosed_decode(s,   n,i,c,pos,cpos,epos,in_str,nx,depth){
       n=length(s); in_str=0; depth=0
       i=1
       while(i<=n){
         c=substr(s,i,1)
-        if(in_str){ if(c==q){ nx=substr(s,i+1,1); if(nx==q){i++;continue} else in_str=0 } i++; continue }
+        # Handle quote escaping ('') — track in_str but still scan for DECODE inside strings
+        if(in_str){
+          if(c==q){ nx=substr(s,i+1,1); if(nx==q){i++;continue} else in_str=0 }
+          # Still check for DECODE inside string literals (dynamic SQL)
+          if(depth>=0 && toupper(substr(s,i,6))=="DECODE"){
+            pos=i
+            if(pos==1 || substr(s,pos-1,1) !~ /[A-Za-z0-9_]/){
+              cpos=i+6
+              while(cpos<=n && (substr(s,cpos,1)==" "||substr(s,cpos,1)=="\t")) cpos++
+              if(cpos<=n && substr(s,cpos,1)=="("){
+                epos=match_paren(s,cpos)
+                if(epos==0) return 1  # 未闭合的 DECODE
+                i=epos+1; continue
+              }
+            }
+          }
+          i++; continue
+        }
         if(c==q){ in_str=1; i++; continue }
         if(c=="(") depth++
         else if(c==")") depth--
@@ -1576,7 +1594,7 @@ _convert_known_semantics() {
       # P2-c: 跨行 DECODE 归一化——检测未闭合的 DECODE(，缓冲后续行直到括号闭合
       if(has_unclosed_decode(line)){
         _dj=line; _dn=1
-        while(_dn < 50 && has_unclosed_decode(_dj)){
+        while(_dn < 200 && has_unclosed_decode(_dj)){
           if((getline _dnx) <= 0) break
           _dn++
           if(_dnx ~ /^[ \t]*--/){ print _dnx; continue }
