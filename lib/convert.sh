@@ -1785,6 +1785,38 @@ _convert_type_aware() {
       sub(/^(IN[ \t]+OUT[ \t]+|INOUT[ \t]+|IN[ \t]+|OUT[ \t]+)/,"",p)                # 去参数 mode
       vn=p; sub(/[ \t].*$/,"",vn); tt=p; sub(/^[A-Za-z_][A-Za-z0-9_]*[ \t]+/,"",tt); sub(/[ \t].*$/,"",tt)
       if (typeclass(tt)!="" && !(vn in type)) type[vn]=typeclass(tt) }
+    function match_paren_in_str(s,op,   n,i,depth,c,in_str,nx){ n=length(s); depth=0; in_str=1
+      for(i=op;i<=n;i++){ c=substr(s,i,1)
+        if(in_str){ if(c==q){ nx=substr(s,i+1,1); if(nx==q){i++;continue} else in_str=0 } 
+          if(c=="(")depth++; else if(c==")"){depth--; if(depth<0)return i}
+          continue }
+        if(c==q){ in_str=1; continue }
+        if(c=="(")depth++; else if(c==")"){depth--; if(depth==0)return i} }
+      return 0 }
+    function conv_decode(line,   out,pos,prev,cpos,epos,mid,A,n,i,expr,cs){
+      out=""
+      while(match(line,/[Dd][Ee][Cc][Oo][Dd][Ee][ \t]*\(/)){
+        pos=RSTART
+        if(pos>1){ prev=substr(line,pos-1,1); if(prev~/[A-Za-z0-9_]/){ out=out substr(line,1,pos); line=substr(line,pos+1); continue } }
+        cpos=pos+RLENGTH-1
+        epos=match_paren(line,cpos)
+        if(epos==0){
+          # Retry with in_str=1 initial state (DECODE inside V_SQL string literal)
+          epos=match_paren_in_str(line,cpos)
+        }
+        if(epos==0){ out=out line; return out }
+        mid=substr(line,cpos+1,epos-cpos-1)
+        n=split_topcomma(mid,A)
+        if(n<3){ out=out substr(line,1,epos); line=substr(line,epos+1); continue }
+        expr=A[1]; cs="CASE"; i=2
+        while(i+1<=n){ cs=cs " WHEN " expr " <=> " A[i] " THEN " A[i+1]; i+=2 }
+        if(i<=n) cs=cs " ELSE " A[i]
+        cs=cs " END"
+        out=out substr(line,1,pos-1)
+        line=cs substr(line,epos+1)
+      }
+      return out line
+    }
     function conv_trunc(line,   out,pos,prev,cpos,epos,mid,A,n,tc,rep){
       out=""
       while(match(line,/TRUNC[ \t]*\(/)){
@@ -1913,10 +1945,36 @@ _convert_type_aware() {
       lines[NR]=$0
     }
     END {   # pass 2：类型感知转换 + NOTE
-      for (i=1; i<=NR; i++) {
+      # Fold multi-line content inside string literals where bracket depth > 0
+      # This enables conv_decode to match parens across lines in V_SQL dynamic SQL
+      folded_text = ""; fold_in_str = 0; fold_depth = 0
+      for (fi=1; fi<=NR; fi++) {
+        fl = lines[fi]
+        if (fi > 1) {
+          if (fold_in_str && fold_depth > 0) folded_text = folded_text " "
+          else folded_text = folded_text "\n"
+        }
+        folded_text = folded_text fl
+        # Scan this line to update fold state for next line boundary
+        fln = length(fl)
+        for (fj=1; fj<=fln; fj++) {
+          fc = substr(fl, fj, 1)
+          fx = substr(fl, fj+1, 1)
+          if (fold_in_str) {
+            if (fc == q) { if (fx == q) { fj++; continue } else { fold_in_str = 0 } continue }
+            if (fc == "(") fold_depth++
+            else if (fc == ")") { if(fold_depth>0) fold_depth-- }
+            continue
+          }
+          if (fc == q) { fold_in_str = 1; fold_depth = 0; continue }
+        }
+      }
+      delete lines
+      nlines = split(folded_text, lines, "\n")
+      for (i=1; i<=nlines; i++) {
         l=lines[i]; note=""
         if (l ~ /^[ \t]*--/) { print l; continue }
-        l=conv_trunc(l); l=conv_instr(l); l=conv_to_number(l); l=conv_to_char_num(l); l=conv_substr(l); l=conv_nextval(l)
+        l=conv_trunc(l); l=conv_instr(l); l=conv_decode(l); l=conv_to_number(l); l=conv_to_char_num(l); l=conv_substr(l); l=conv_nextval(l)
         check_date_arith(l)
         if (note != "") print "-- TODO(需人工): " note
         print l
