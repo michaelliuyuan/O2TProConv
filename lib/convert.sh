@@ -693,15 +693,26 @@ _strip_gbk_comments() {
     printf '%s' "$text"
     return 0
   fi
-  # GBK encoded input — convert to UTF-8 first so downstream passes
-  # (_strip_dynsql_inline_comments, _restructure) get proper quote/context tracking
+  # Non-UTF-8 input (likely GBK from Oracle .pck export) — try GBK→UTF-8 conversion
+  # Oracle .pck exports are standard GBK encoding, no need to guess
   local converted
-  converted="$(printf '%s' "$text" | iconv -f GBK -t UTF-8 //IGNORE 2>/dev/null)"
-  if [[ $? -eq 0 ]] && [[ -n "$converted" ]]; then
-    printf '%s' "$converted"
-    return 0
+  converted="$(printf '%s' "$text" | iconv -f GBK -t UTF-8//IGNORE 2>/dev/null)"
+  if [[ -n "$converted" ]]; then
+    # Verify conversion produced valid UTF-8
+    if printf '%s' "$converted" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+      printf '%s' "$converted"
+      return 0
+    fi
   fi
-  # Fallback: iconv failed — strip non-ASCII bytes as ? to preserve quote pairing
+  # Also try GB18030 (superset of GBK, covers more characters)
+  converted="$(printf '%s' "$text" | iconv -f GB18030 -t UTF-8//IGNORE 2>/dev/null)"
+  if [[ -n "$converted" ]]; then
+    if printf '%s' "$converted" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+      printf '%s' "$converted"
+      return 0
+    fi
+  fi
+  # Fallback: all iconv attempts failed — strip non-ASCII bytes as ? to preserve quote pairing
   printf '%s' "$text" | sed -E \
     -e 's/[^[:print:][:space:]]/?/g' \
     -e 's/[[:space:]]*-*--[[:space:]]*$//' \
