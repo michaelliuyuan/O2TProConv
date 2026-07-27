@@ -1544,7 +1544,9 @@ _convert_known_semantics() {
             out=out substr(line,1,epos); line=rest; continue
           }
           repl="GROUP_CONCAT(" expr sep_clause ")"
-          if (!has_sep) todo=todo "LISTAGG 无分隔符: MySQL GROUP_CONCAT 默认逗号(vs Oracle 空串), 动态 SQL 内省略 SEPARATOR 避免引号转义; "
+          # Oracle LISTAGG without separator arg = empty string concat (not comma)
+          # Always add SEPARATOR '' for no-separator LISTAGG to match Oracle semantics
+          if (!has_sep) repl="GROUP_CONCAT(" expr " SEPARATOR " q q ")"
           out=out substr(line,1,pos-1) repl
           line=rest
         }
